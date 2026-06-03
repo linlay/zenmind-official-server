@@ -21,6 +21,11 @@ type Config struct {
 	GoogleRedirectURL string
 	AuthSuccessURL    string
 	AuthFailureURL    string
+	SMTPHost          string
+	SMTPPort          string
+	SMTPUsername      string
+	SMTPPassword      string
+	SMTPFrom          string
 }
 
 func FromEnv() (Config, error) {
@@ -34,6 +39,11 @@ func FromEnv() (Config, error) {
 		GoogleRedirectURL: os.Getenv("GOOGLE_REDIRECT_URL"),
 		AuthSuccessURL:    env("AUTH_SUCCESS_URL", "http://localhost:5173/login"),
 		AuthFailureURL:    env("AUTH_FAILURE_URL", "http://localhost:5173/login"),
+		SMTPHost:          env("SMTP_HOST", "smtp.gmail.com"),
+		SMTPPort:          env("SMTP_PORT", "587"),
+		SMTPUsername:      env("SMTP_USERNAME", "linlay.zenmind@gmail.com"),
+		SMTPPassword:      os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:          env("SMTP_FROM", "linlay.zenmind@gmail.com"),
 	}
 
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")

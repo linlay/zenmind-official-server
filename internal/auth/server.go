@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +27,7 @@ type Server struct {
 	google         GoogleProvider
 	authSuccessURL string
 	authFailureURL string
+	mailer         Mailer
 	now            func() time.Time
 }
 
@@ -34,6 +38,7 @@ type ServerOptions struct {
 	Google         GoogleProvider
 	AuthSuccessURL string
 	AuthFailureURL string
+	Mailer         Mailer
 }
 
 func NewServer(store Store, opts ServerOptions) *Server {
@@ -49,6 +54,10 @@ func NewServer(store Store, opts ServerOptions) *Server {
 	if google == nil {
 		google = disabledGoogleProvider{}
 	}
+	mailer := opts.Mailer
+	if mailer == nil {
+		mailer = disabledMailer{}
+	}
 
 	return &Server{
 		store:          store,
@@ -58,6 +67,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		google:         google,
 		authSuccessURL: strings.TrimSpace(opts.AuthSuccessURL),
 		authFailureURL: strings.TrimSpace(opts.AuthFailureURL),
+		mailer:         mailer,
 		now:            time.Now,
 	}
 }
@@ -65,7 +75,11 @@ func NewServer(store Store, opts ServerOptions) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/downloads/stats", s.downloadStats)
+	mux.HandleFunc("POST /api/downloads/events", s.downloadEvent)
 	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("POST /api/auth/email-code/start", s.emailCodeStart)
+	mux.HandleFunc("POST /api/auth/email-code/verify", s.emailCodeVerify)
 	mux.HandleFunc("GET /api/auth/google/start", s.googleStart)
 	mux.HandleFunc("GET /api/auth/google/callback", s.googleCallback)
 	mux.HandleFunc("GET /api/v1/auth/google/callback", s.googleCallback)
@@ -92,6 +106,26 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 type loginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+}
+
+type emailCodeStartRequest struct {
+	Email string `json:"email"`
+}
+
+type emailCodeVerifyRequest struct {
+	Email string `json:"email"`
+	Code  string `json:"code"`
+}
+
+type downloadEventRequest struct {
+	InstallerKey string `json:"installerKey"`
+}
+
+var emailPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+
+var allowedInstallerKeys = map[string]bool{
+	"mac":     true,
+	"windows": true,
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +168,122 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 
 	http.SetCookie(w, s.sessionCookie(token, expiresAt))
 	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
+}
+
+func (s *Server) emailCodeStart(w http.ResponseWriter, r *http.Request) {
+	var req emailCodeStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid verification request.")
+		return
+	}
+	email := normalizeEmail(req.Email)
+	if !validEmail(email) {
+		writeError(w, http.StatusBadRequest, "invalid_email", "Please enter a valid email address.")
+		return
+	}
+
+	code, err := randomDigits(6)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to create verification code.")
+		return
+	}
+	expiresAt := s.now().UTC().Add(10 * time.Minute)
+	if err := s.store.SaveEmailCode(r.Context(), email, emailCodeHash(email, code), expiresAt); err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save verification code.")
+		return
+	}
+	if err := s.mailer.SendEmailCode(r.Context(), email, code); err != nil {
+		writeError(w, http.StatusInternalServerError, "email_not_configured", "Unable to send verification email.")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "expiresAt": expiresAt})
+}
+
+func (s *Server) emailCodeVerify(w http.ResponseWriter, r *http.Request) {
+	var req emailCodeVerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid verification request.")
+		return
+	}
+	email := normalizeEmail(req.Email)
+	code := strings.TrimSpace(req.Code)
+	if !validEmail(email) || !validEmailCode(code) {
+		s.recordLogin(r, LoginLog{Email: email, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "invalid_code"})
+		writeError(w, http.StatusUnauthorized, "invalid_code", "Verification code is incorrect or expired.")
+		return
+	}
+
+	if err := s.store.ConsumeEmailCode(r.Context(), email, emailCodeHash(email, code), s.now().UTC()); err != nil {
+		s.recordLogin(r, LoginLog{Email: email, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "invalid_code"})
+		writeError(w, http.StatusUnauthorized, "invalid_code", "Verification code is incorrect or expired.")
+		return
+	}
+
+	user, err := s.store.UpsertEmailCodeUser(r.Context(), email, requestIP(r))
+	if err != nil {
+		s.recordLogin(r, LoginLog{Email: email, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "user_upsert_failed"})
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save user account.")
+		return
+	}
+	if !user.Enabled {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "account_disabled"})
+		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+
+	token, expiresAt, err := s.createSession(r, user.ID)
+	if err != nil {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "session_create_failed"})
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
+		return
+	}
+	now := s.now().UTC()
+	_ = s.store.TouchLastLogin(r.Context(), user.ID, now)
+	user.LastLoginAt = &now
+	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "email_code", LoginResult: "success"})
+
+	http.SetCookie(w, s.sessionCookie(token, expiresAt))
+	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
+}
+
+func (s *Server) downloadStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.ListDownloadStats(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read download stats.")
+		return
+	}
+	totals := map[string]int64{}
+	for key := range allowedInstallerKeys {
+		totals[key] = 0
+	}
+	for _, stat := range stats {
+		if allowedInstallerKeys[stat.InstallerKey] {
+			totals[stat.InstallerKey] = stat.Total
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"totals": totals})
+}
+
+func (s *Server) downloadEvent(w http.ResponseWriter, r *http.Request) {
+	var req downloadEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid download event.")
+		return
+	}
+	installerKey := strings.TrimSpace(req.InstallerKey)
+	if !allowedInstallerKeys[installerKey] {
+		writeError(w, http.StatusBadRequest, "invalid_installer", "Unknown installer.")
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.store.IncrementDownloadCount(ctx, installerKey)
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
 func (s *Server) googleStart(w http.ResponseWriter, r *http.Request) {
@@ -373,9 +523,49 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(bytes[:]), nil
 }
 
+func randomDigits(length int) (string, error) {
+	if length <= 0 {
+		return "", fmt.Errorf("invalid code length")
+	}
+	var builder strings.Builder
+	builder.Grow(length)
+	for builder.Len() < length {
+		var b [1]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", err
+		}
+		if b[0] > 249 {
+			continue
+		}
+		builder.WriteString(strconv.Itoa(int(b[0] % 10)))
+	}
+	return builder.String(), nil
+}
+
 func tokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+func emailCodeHash(email, code string) string {
+	sum := sha256.Sum256([]byte(normalizeEmail(email) + ":" + strings.TrimSpace(code)))
+	return hex.EncodeToString(sum[:])
+}
+
+func validEmail(email string) bool {
+	return len(email) <= 255 && emailPattern.MatchString(email)
+}
+
+func validEmailCode(code string) bool {
+	if len(code) != 6 {
+		return false
+	}
+	for _, ch := range code {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

@@ -41,16 +41,33 @@ type LoginLog struct {
 	LoginAt       time.Time
 }
 
+type EmailCodeChallenge struct {
+	ID        int64
+	Email     string
+	CodeHash  string
+	ExpiresAt time.Time
+}
+
+type DownloadStat struct {
+	InstallerKey string `json:"installerKey"`
+	Total        int64  `json:"total"`
+}
+
 type Store interface {
 	EnsureSchema(ctx context.Context) error
 	EnsureAdmin(ctx context.Context, email, passwordHash string) error
 	FindLocalUserByEmail(ctx context.Context, email string) (User, error)
 	FindUserBySession(ctx context.Context, tokenHash string, now time.Time) (User, error)
 	UpsertGoogleUser(ctx context.Context, identity GoogleIdentity, ip string) (User, error)
+	UpsertEmailCodeUser(ctx context.Context, email, ip string) (User, error)
+	SaveEmailCode(ctx context.Context, email, codeHash string, expiresAt time.Time) error
+	ConsumeEmailCode(ctx context.Context, email, codeHash string, now time.Time) error
 	CreateSession(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time, userAgent, ip string) error
 	RevokeSession(ctx context.Context, tokenHash string) error
 	TouchLastLogin(ctx context.Context, userID int64, loggedInAt time.Time) error
 	RecordLogin(ctx context.Context, entry LoginLog) error
+	ListDownloadStats(ctx context.Context) ([]DownloadStat, error)
+	IncrementDownloadCount(ctx context.Context, installerKey string) error
 }
 
 type MySQLStore struct {
@@ -131,6 +148,24 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 			KEY IDX_AUTH_LOGIN_LOG_USER_AT (USER_ID_, LOGIN_AT_),
 			KEY IDX_AUTH_LOGIN_LOG_METHOD_AT (AUTH_METHOD_, LOGIN_AT_),
 			CONSTRAINT FK_AUTH_LOGIN_LOG_USER FOREIGN KEY (USER_ID_) REFERENCES auth_user (ID_) ON DELETE SET NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS auth_email_code (
+			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			EMAIL_ VARCHAR(255) NOT NULL,
+			CODE_HASH_ CHAR(64) NOT NULL,
+			EXPIRES_AT_ DATETIME(3) NOT NULL,
+			CONSUMED_AT_ DATETIME(3) NULL,
+			CREATED_AT_ DATETIME(3) NOT NULL,
+			PRIMARY KEY (ID_),
+			KEY IDX_AUTH_EMAIL_CODE_EMAIL_CREATED (EMAIL_, CREATED_AT_),
+			KEY IDX_AUTH_EMAIL_CODE_EXPIRES (EXPIRES_AT_)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS download_stat (
+			INSTALLER_KEY_ VARCHAR(64) NOT NULL,
+			TOTAL_ BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			CREATED_AT_ DATETIME(3) NOT NULL,
+			UPDATED_AT_ DATETIME(3) NOT NULL,
+			PRIMARY KEY (INSTALLER_KEY_)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 	}
 
@@ -275,6 +310,94 @@ func (s *MySQLStore) UpsertGoogleUser(ctx context.Context, identity GoogleIdenti
 	return user, nil
 }
 
+func (s *MySQLStore) UpsertEmailCodeUser(ctx context.Context, email, ip string) (User, error) {
+	now := time.Now().UTC()
+	email = normalizeEmail(email)
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO auth_user (EMAIL_, DISPLAY_NAME_, AUTH_PROVIDER_, AUTH_SUB_, ROLE_, ENABLED_, CREATED_AT_, UPDATED_AT_, LAST_LOGIN_AT_)
+		 VALUES (?, ?, 'email_code', ?, 'user', 1, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		   EMAIL_ = VALUES(EMAIL_),
+		   DISPLAY_NAME_ = IF(DISPLAY_NAME_ = '' OR DISPLAY_NAME_ = AUTH_SUB_, VALUES(DISPLAY_NAME_), DISPLAY_NAME_),
+		   UPDATED_AT_ = VALUES(UPDATED_AT_),
+		   LAST_LOGIN_AT_ = VALUES(LAST_LOGIN_AT_)`,
+		email,
+		email,
+		email,
+		now,
+		now,
+		now,
+	)
+	if err != nil {
+		return User{}, err
+	}
+
+	row := s.db.QueryRowContext(
+		ctx,
+		userSelectList+`
+		 , '' AS PASSWORD_HASH_
+		 FROM auth_user u
+		 WHERE u.AUTH_PROVIDER_ = 'email_code' AND u.AUTH_SUB_ = ?`,
+		email,
+	)
+	user, err := scanUserWithPassword(row)
+	if err != nil {
+		return User{}, err
+	}
+	_ = ip
+	return user, nil
+}
+
+func (s *MySQLStore) SaveEmailCode(ctx context.Context, email, codeHash string, expiresAt time.Time) error {
+	now := time.Now().UTC()
+	email = normalizeEmail(email)
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO auth_email_code (EMAIL_, CODE_HASH_, EXPIRES_AT_, CREATED_AT_)
+		 VALUES (?, ?, ?, ?)`,
+		email,
+		codeHash,
+		expiresAt,
+		now,
+	)
+	return err
+}
+
+func (s *MySQLStore) ConsumeEmailCode(ctx context.Context, email, codeHash string, now time.Time) error {
+	email = normalizeEmail(email)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var challenge EmailCodeChallenge
+	row := tx.QueryRowContext(
+		ctx,
+		`SELECT ID_, EMAIL_, CODE_HASH_, EXPIRES_AT_
+		 FROM auth_email_code
+		 WHERE EMAIL_ = ? AND CONSUMED_AT_ IS NULL
+		 ORDER BY CREATED_AT_ DESC
+		 LIMIT 1
+		 FOR UPDATE`,
+		email,
+	)
+	if err := row.Scan(&challenge.ID, &challenge.Email, &challenge.CodeHash, &challenge.ExpiresAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if !challenge.ExpiresAt.After(now) || challenge.CodeHash != codeHash {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE auth_email_code SET CONSUMED_AT_ = ? WHERE ID_ = ?`, now, challenge.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *MySQLStore) CreateSession(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time, userAgent, ip string) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(
@@ -319,6 +442,41 @@ func (s *MySQLStore) RecordLogin(ctx context.Context, entry LoginLog) error {
 		truncate(strings.TrimSpace(entry.IP), 64),
 		truncate(strings.TrimSpace(entry.UserAgent), 512),
 		entry.LoginAt,
+	)
+	return err
+}
+
+func (s *MySQLStore) ListDownloadStats(ctx context.Context) ([]DownloadStat, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT INSTALLER_KEY_, TOTAL_ FROM download_stat`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stats []DownloadStat
+	for rows.Next() {
+		var stat DownloadStat
+		if err := rows.Scan(&stat.InstallerKey, &stat.Total); err != nil {
+			return nil, err
+		}
+		stats = append(stats, stat)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func (s *MySQLStore) IncrementDownloadCount(ctx context.Context, installerKey string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO download_stat (INSTALLER_KEY_, TOTAL_, CREATED_AT_, UPDATED_AT_)
+		 VALUES (?, 1, ?, ?)
+		 ON DUPLICATE KEY UPDATE TOTAL_ = TOTAL_ + 1, UPDATED_AT_ = VALUES(UPDATED_AT_)`,
+		truncate(strings.TrimSpace(installerKey), 64),
+		now,
+		now,
 	)
 	return err
 }

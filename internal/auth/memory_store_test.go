@@ -12,8 +12,11 @@ type memoryStore struct {
 	users    map[int64]User
 	local    map[string]int64
 	google   map[string]int64
+	email    map[string]int64
 	sessions map[string]sessionRecord
 	logins   []LoginLog
+	codes    []emailCodeRecord
+	stats    map[string]int64
 }
 
 type sessionRecord struct {
@@ -22,13 +25,22 @@ type sessionRecord struct {
 	revoked   bool
 }
 
+type emailCodeRecord struct {
+	email      string
+	codeHash   string
+	expiresAt  time.Time
+	consumedAt *time.Time
+}
+
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
 		nextID:   1,
 		users:    map[int64]User{},
 		local:    map[string]int64{},
 		google:   map[string]int64{},
+		email:    map[string]int64{},
 		sessions: map[string]sessionRecord{},
+		stats:    map[string]int64{},
 	}
 }
 
@@ -123,6 +135,62 @@ func (s *memoryStore) UpsertGoogleUser(_ context.Context, identity GoogleIdentit
 	return user, nil
 }
 
+func (s *memoryStore) UpsertEmailCodeUser(_ context.Context, email, _ string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	email = normalizeEmail(email)
+	userID, exists := s.email[email]
+	if !exists {
+		userID = s.nextID
+		s.nextID++
+		s.email[email] = userID
+	}
+
+	user := s.users[userID]
+	user.ID = userID
+	user.Email = email
+	user.DisplayName = email
+	user.AuthProvider = "email_code"
+	user.AuthSub = email
+	user.Role = "user"
+	user.Enabled = true
+	s.users[userID] = user
+	return user, nil
+}
+
+func (s *memoryStore) SaveEmailCode(_ context.Context, email, codeHash string, expiresAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.codes = append(s.codes, emailCodeRecord{
+		email:     normalizeEmail(email),
+		codeHash:  codeHash,
+		expiresAt: expiresAt,
+	})
+	return nil
+}
+
+func (s *memoryStore) ConsumeEmailCode(_ context.Context, email, codeHash string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	email = normalizeEmail(email)
+	for i := len(s.codes) - 1; i >= 0; i-- {
+		code := s.codes[i]
+		if code.email != email || code.consumedAt != nil {
+			continue
+		}
+		if !code.expiresAt.After(now) || code.codeHash != codeHash {
+			return ErrNotFound
+		}
+		consumedAt := now
+		s.codes[i].consumedAt = &consumedAt
+		return nil
+	}
+	return ErrNotFound
+}
+
 func (s *memoryStore) CreateSession(_ context.Context, userID int64, tokenHash string, expiresAt time.Time, _, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,5 +229,24 @@ func (s *memoryStore) RecordLogin(_ context.Context, entry LoginLog) error {
 	defer s.mu.Unlock()
 
 	s.logins = append(s.logins, entry)
+	return nil
+}
+
+func (s *memoryStore) ListDownloadStats(context.Context) ([]DownloadStat, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stats := make([]DownloadStat, 0, len(s.stats))
+	for key, total := range s.stats {
+		stats = append(stats, DownloadStat{InstallerKey: key, Total: total})
+	}
+	return stats, nil
+}
+
+func (s *memoryStore) IncrementDownloadCount(_ context.Context, installerKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.stats[installerKey]++
 	return nil
 }

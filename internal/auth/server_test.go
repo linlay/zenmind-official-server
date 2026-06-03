@@ -108,6 +108,118 @@ func TestMeWithoutSessionIsUnauthorized(t *testing.T) {
 	}
 }
 
+func TestEmailCodeStartSendsCode(t *testing.T) {
+	handler, store, mailer := testHandlerWithMailer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/email-code/start", bytes.NewBufferString(`{"email":"New@Example.com"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if mailer.to != "new@example.com" || !validEmailCode(mailer.code) {
+		t.Fatalf("unexpected email delivery: %#v", mailer)
+	}
+	if len(store.codes) != 1 || store.codes[0].email != "new@example.com" {
+		t.Fatalf("unexpected stored codes: %#v", store.codes)
+	}
+}
+
+func TestEmailCodeVerifyCreatesSessionAndConsumesCode(t *testing.T) {
+	handler, store, mailer := testHandlerWithMailer(t)
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/auth/email-code/start", bytes.NewBufferString(`{"email":"new@example.com"}`))
+	startRec := httptest.NewRecorder()
+	handler.ServeHTTP(startRec, startReq)
+	if startRec.Code != http.StatusOK {
+		t.Fatalf("start status = %d body = %s", startRec.Code, startRec.Body.String())
+	}
+
+	verifyReq := httptest.NewRequest(http.MethodPost, "/api/auth/email-code/verify", bytes.NewBufferString(`{"email":"new@example.com","code":"`+mailer.code+`"}`))
+	verifyRec := httptest.NewRecorder()
+	handler.ServeHTTP(verifyRec, verifyReq)
+	if verifyRec.Code != http.StatusOK {
+		t.Fatalf("verify status = %d body = %s", verifyRec.Code, verifyRec.Body.String())
+	}
+	cookies := verifyRec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "test_session" {
+		t.Fatalf("unexpected verify cookies: %#v", cookies)
+	}
+	if len(store.email) != 1 {
+		t.Fatalf("expected email-code user, got %#v", store.email)
+	}
+
+	reuseReq := httptest.NewRequest(http.MethodPost, "/api/auth/email-code/verify", bytes.NewBufferString(`{"email":"new@example.com","code":"`+mailer.code+`"}`))
+	reuseRec := httptest.NewRecorder()
+	handler.ServeHTTP(reuseRec, reuseReq)
+	if reuseRec.Code != http.StatusUnauthorized {
+		t.Fatalf("reuse status = %d body = %s", reuseRec.Code, reuseRec.Body.String())
+	}
+}
+
+func TestEmailCodeRejectsInvalidEmail(t *testing.T) {
+	handler, _, _ := testHandlerWithMailer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/email-code/start", bytes.NewBufferString(`{"email":"not-email"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDownloadStatsAndEvent(t *testing.T) {
+	handler, store := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/downloads/events", bytes.NewBufferString(`{"installerKey":"mac"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("event status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		total := store.stats["mac"]
+		store.mu.Unlock()
+		if total == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	statsReq := httptest.NewRequest(http.MethodGet, "/api/downloads/stats", nil)
+	statsRec := httptest.NewRecorder()
+	handler.ServeHTTP(statsRec, statsReq)
+	if statsRec.Code != http.StatusOK {
+		t.Fatalf("stats status = %d body = %s", statsRec.Code, statsRec.Body.String())
+	}
+	var body struct {
+		Totals map[string]int64 `json:"totals"`
+	}
+	if err := json.NewDecoder(statsRec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if body.Totals["mac"] != 1 || body.Totals["windows"] != 0 {
+		t.Fatalf("unexpected totals: %#v", body.Totals)
+	}
+}
+
+func TestDownloadEventRejectsUnknownInstaller(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/downloads/events", bytes.NewBufferString(`{"installerKey":"linux"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestGoogleStartRedirectsAndSetsStateCookie(t *testing.T) {
 	handler, _ := testHandler(t)
 
@@ -213,6 +325,25 @@ func testHandler(t *testing.T) (http.Handler, *memoryStore) {
 	return server.Routes(), store
 }
 
+func testHandlerWithMailer(t *testing.T) (http.Handler, *memoryStore, *fakeMailer) {
+	t.Helper()
+
+	store := newMemoryStore()
+	if err := EnsureInitialAdmin(context.Background(), store, "admin@zenmind.cc", "correct-password"); err != nil {
+		t.Fatalf("init admin: %v", err)
+	}
+	mailer := &fakeMailer{}
+	server := NewServer(store, ServerOptions{
+		CookieName:     "test_session",
+		SessionTTL:     time.Hour,
+		Google:         fakeGoogleProvider{},
+		AuthSuccessURL: "http://localhost:5173/login",
+		AuthFailureURL: "http://localhost:5173/login",
+		Mailer:         mailer,
+	})
+	return server.Routes(), store, mailer
+}
+
 type fakeGoogleProvider struct{}
 
 func (fakeGoogleProvider) Configured() bool {
@@ -230,4 +361,15 @@ func (fakeGoogleProvider) ExchangeCode(context.Context, string) (GoogleIdentity,
 		Name:    "Google User",
 		Picture: "https://example.com/avatar.png",
 	}, nil
+}
+
+type fakeMailer struct {
+	to   string
+	code string
+}
+
+func (m *fakeMailer) SendEmailCode(_ context.Context, to, code string) error {
+	m.to = to
+	m.code = code
+	return nil
 }

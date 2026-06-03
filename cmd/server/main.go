@@ -54,6 +54,13 @@ func run() error {
 		}),
 		AuthSuccessURL: cfg.AuthSuccessURL,
 		AuthFailureURL: cfg.AuthFailureURL,
+		Mailer: auth.NewSMTPMailer(auth.SMTPMailerConfig{
+			Host:     cfg.SMTPHost,
+			Port:     cfg.SMTPPort,
+			Username: cfg.SMTPUsername,
+			Password: cfg.SMTPPassword,
+			From:     cfg.SMTPFrom,
+		}),
 	})
 	server := &http.Server{
 		Addr:              cfg.Addr,
