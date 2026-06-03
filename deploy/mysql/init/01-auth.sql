@@ -1,8 +1,4 @@
 CREATE DATABASE IF NOT EXISTS zenmind_website CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
--- Replace this placeholder before running the script in any shared environment.
-CREATE USER IF NOT EXISTS 'zenmind'@'%' IDENTIFIED BY '<set-a-strong-password>';
-GRANT ALL PRIVILEGES ON zenmind_website.* TO 'zenmind'@'%';
-FLUSH PRIVILEGES;
 
 USE zenmind_website;
 

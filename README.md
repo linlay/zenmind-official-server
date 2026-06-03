@@ -34,14 +34,7 @@ Required values:
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 
-Create a MySQL user with a strong password, then set the same value in `MYSQL_PASSWORD`:
-
-```sql
-CREATE USER 'zenmind'@'%' IDENTIFIED BY '<set-a-strong-password>';
-GRANT ALL PRIVILEGES ON zenmind_website.* TO 'zenmind'@'%';
-```
-
-The matching initialization script lives in `deploy/mysql/init/01-auth.sql`; replace its password placeholder before using it outside local development.
+Compose only deploys the Go server. MySQL is expected to be provided separately; set `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD` to the provided database server. The schema initialization script lives in `deploy/mysql/init/01-auth.sql`.
 
 ## Development
 
@@ -52,9 +45,23 @@ go run ./cmd/server
 
 ## Container
 
+Create the shared deployment network once:
+
+```bash
+docker network create zenmind-official-net
+```
+
+Run the server container:
+
+```bash
+docker compose up --build
+```
+
+The `server` service joins `zenmind-official-net` as `zenmind-official-server`. The host port defaults to `8080` and can be overridden with `SERVER_PORT`.
+
+For a standalone image build:
+
 ```bash
 docker build -t zenmind-official-server .
 docker run --env-file .env -p 8080:8080 zenmind-official-server
 ```
-
-This project does not include a cross-project Compose file. Run MySQL separately or provide it through your deployment platform.

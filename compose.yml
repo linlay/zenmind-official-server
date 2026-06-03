@@ -1,0 +1,19 @@
+services:
+  server:
+    build:
+      context: .
+    image: zenmind-official-server
+    container_name: zenmind-official-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    networks:
+      zenmind-official-net:
+        aliases:
+          - zenmind-official-server
+
+networks:
+  zenmind-official-net:
+    external: true
