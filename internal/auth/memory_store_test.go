@@ -1,0 +1,165 @@
+package auth
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+type memoryStore struct {
+	mu       sync.Mutex
+	nextID   int64
+	users    map[int64]User
+	local    map[string]int64
+	google   map[string]int64
+	sessions map[string]sessionRecord
+	logins   []LoginLog
+}
+
+type sessionRecord struct {
+	userID    int64
+	expiresAt time.Time
+	revoked   bool
+}
+
+func newMemoryStore() *memoryStore {
+	return &memoryStore{
+		nextID:   1,
+		users:    map[int64]User{},
+		local:    map[string]int64{},
+		google:   map[string]int64{},
+		sessions: map[string]sessionRecord{},
+	}
+}
+
+func (s *memoryStore) EnsureSchema(context.Context) error {
+	return nil
+}
+
+func (s *memoryStore) EnsureAdmin(_ context.Context, email, passwordHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	email = normalizeEmail(email)
+	if _, exists := s.local[email]; exists {
+		return nil
+	}
+	user := User{
+		ID:           s.nextID,
+		Email:        email,
+		DisplayName:  email,
+		AuthProvider: "local",
+		AuthSub:      email,
+		PasswordHash: passwordHash,
+		Role:         "admin",
+		Enabled:      true,
+	}
+	s.nextID++
+	s.users[user.ID] = user
+	s.local[email] = user.ID
+	return nil
+}
+
+func (s *memoryStore) FindLocalUserByEmail(_ context.Context, email string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	userID, ok := s.local[normalizeEmail(email)]
+	if !ok {
+		return User{}, ErrNotFound
+	}
+	return s.users[userID], nil
+}
+
+func (s *memoryStore) FindUserBySession(_ context.Context, tokenHash string, now time.Time) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.sessions[tokenHash]
+	if !ok || session.revoked || !session.expiresAt.After(now) {
+		return User{}, ErrNotFound
+	}
+	user, ok := s.users[session.userID]
+	if !ok {
+		return User{}, ErrNotFound
+	}
+	if !user.Enabled {
+		return User{}, ErrDisabledUser
+	}
+	return user, nil
+}
+
+func (s *memoryStore) UpsertGoogleUser(_ context.Context, identity GoogleIdentity, _ string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	subject := normalizeEmail(identity.Subject)
+	if subject == "" {
+		return User{}, ErrNotFound
+	}
+
+	userID, exists := s.google[subject]
+	if !exists {
+		userID = s.nextID
+		s.nextID++
+		s.google[subject] = userID
+	}
+
+	email := normalizeEmail(identity.Email)
+	displayName := identity.Name
+	if displayName == "" {
+		displayName = email
+	}
+	user := s.users[userID]
+	user.ID = userID
+	user.Email = email
+	user.DisplayName = displayName
+	user.AvatarURL = identity.Picture
+	user.AuthProvider = "google"
+	user.AuthSub = subject
+	user.Role = "user"
+	user.Enabled = true
+	s.users[userID] = user
+	return user, nil
+}
+
+func (s *memoryStore) CreateSession(_ context.Context, userID int64, tokenHash string, expiresAt time.Time, _, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sessions[tokenHash] = sessionRecord{userID: userID, expiresAt: expiresAt}
+	return nil
+}
+
+func (s *memoryStore) RevokeSession(_ context.Context, tokenHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.sessions[tokenHash]
+	if ok {
+		session.revoked = true
+		s.sessions[tokenHash] = session
+	}
+	return nil
+}
+
+func (s *memoryStore) TouchLastLogin(_ context.Context, userID int64, loggedInAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.users[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	user.LastLoginAt = &loggedInAt
+	s.users[userID] = user
+	return nil
+}
+
+func (s *memoryStore) RecordLogin(_ context.Context, entry LoginLog) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logins = append(s.logins, entry)
+	return nil
+}
