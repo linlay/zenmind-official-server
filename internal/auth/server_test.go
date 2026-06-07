@@ -173,7 +173,7 @@ func TestEmailCodeRejectsInvalidEmail(t *testing.T) {
 func TestDownloadStatsAndEvent(t *testing.T) {
 	handler, store := testHandler(t)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/downloads/events", bytes.NewBufferString(`{"installerKey":"mac"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/downloads/events", bytes.NewBufferString(`{"installerKey":"mac","version":"0.2.4"}`))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -184,8 +184,9 @@ func TestDownloadStatsAndEvent(t *testing.T) {
 	for time.Now().Before(deadline) {
 		store.mu.Lock()
 		total := store.stats["mac"]
+		events := len(store.events)
 		store.mu.Unlock()
-		if total == 1 {
+		if total == 1 && events == 1 {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -206,6 +207,19 @@ func TestDownloadStatsAndEvent(t *testing.T) {
 	if body.Totals["mac"] != 1 || body.Totals["windows"] != 0 {
 		t.Fatalf("unexpected totals: %#v", body.Totals)
 	}
+
+	store.mu.Lock()
+	if len(store.events) != 1 {
+		t.Fatalf("expected 1 download event, got %d", len(store.events))
+	}
+	event := store.events[0]
+	if event.InstallerKey != "mac" || event.Version != "0.2.4" {
+		t.Fatalf("unexpected download event: installerKey=%q version=%q", event.InstallerKey, event.Version)
+	}
+	if event.IP == "" {
+		t.Fatalf("expected IP to be recorded, got empty")
+	}
+	store.mu.Unlock()
 }
 
 func TestDownloadEventRejectsUnknownInstaller(t *testing.T) {

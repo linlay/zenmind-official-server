@@ -53,6 +53,15 @@ type DownloadStat struct {
 	Total        int64  `json:"total"`
 }
 
+type DownloadEvent struct {
+	ID            int64     `json:"id"`
+	InstallerKey  string    `json:"installerKey"`
+	Version       string    `json:"version"`
+	IP            string    `json:"ip"`
+	UserAgent     string    `json:"userAgent"`
+	DownloadedAt  time.Time `json:"downloadedAt"`
+}
+
 type Store interface {
 	EnsureSchema(ctx context.Context) error
 	EnsureAdmin(ctx context.Context, email, passwordHash string) error
@@ -68,6 +77,7 @@ type Store interface {
 	RecordLogin(ctx context.Context, entry LoginLog) error
 	ListDownloadStats(ctx context.Context) ([]DownloadStat, error)
 	IncrementDownloadCount(ctx context.Context, installerKey string) error
+	RecordDownloadEvent(ctx context.Context, installerKey, version, ip, userAgent string, downloadedAt time.Time) error
 }
 
 type MySQLStore struct {
@@ -166,6 +176,16 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 			CREATED_AT_ DATETIME(3) NOT NULL,
 			UPDATED_AT_ DATETIME(3) NOT NULL,
 			PRIMARY KEY (INSTALLER_KEY_)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS download (
+			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			INSTALLER_KEY_ VARCHAR(64) NOT NULL,
+			VERSION_ VARCHAR(32) NOT NULL DEFAULT '',
+			IP_ VARCHAR(64) NOT NULL DEFAULT '',
+			USER_AGENT_ VARCHAR(512) NOT NULL DEFAULT '',
+			DOWNLOADED_AT_ DATETIME(3) NOT NULL,
+			PRIMARY KEY (ID_),
+			KEY IDX_DOWNLOAD_INSTALLER_AT (INSTALLER_KEY_, DOWNLOADED_AT_)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 	}
 
@@ -477,6 +497,20 @@ func (s *MySQLStore) IncrementDownloadCount(ctx context.Context, installerKey st
 		truncate(strings.TrimSpace(installerKey), 64),
 		now,
 		now,
+	)
+	return err
+}
+
+func (s *MySQLStore) RecordDownloadEvent(ctx context.Context, installerKey, version, ip, userAgent string, downloadedAt time.Time) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO download (INSTALLER_KEY_, VERSION_, IP_, USER_AGENT_, DOWNLOADED_AT_)
+		 VALUES (?, ?, ?, ?, ?)`,
+		truncate(strings.TrimSpace(installerKey), 64),
+		truncate(strings.TrimSpace(version), 32),
+		truncate(strings.TrimSpace(ip), 64),
+		truncate(strings.TrimSpace(userAgent), 512),
+		downloadedAt,
 	)
 	return err
 }

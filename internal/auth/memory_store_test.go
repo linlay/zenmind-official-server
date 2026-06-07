@@ -17,6 +17,7 @@ type memoryStore struct {
 	logins   []LoginLog
 	codes    []emailCodeRecord
 	stats    map[string]int64
+	events   []DownloadEvent
 }
 
 type sessionRecord struct {
@@ -248,5 +249,20 @@ func (s *memoryStore) IncrementDownloadCount(_ context.Context, installerKey str
 	defer s.mu.Unlock()
 
 	s.stats[installerKey]++
+	return nil
+}
+
+func (s *memoryStore) RecordDownloadEvent(_ context.Context, installerKey, version, ip, userAgent string, downloadedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.events = append(s.events, DownloadEvent{
+		ID:           int64(len(s.events) + 1),
+		InstallerKey: installerKey,
+		Version:      version,
+		IP:           ip,
+		UserAgent:    userAgent,
+		DownloadedAt: downloadedAt,
+	})
 	return nil
 }
