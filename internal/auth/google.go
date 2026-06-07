@@ -36,6 +36,7 @@ type GoogleProvider interface {
 	Configured() bool
 	AuthCodeURL(state string) string
 	ExchangeCode(ctx context.Context, code string) (GoogleIdentity, error)
+	VerifyIDToken(ctx context.Context, rawToken string) (GoogleIdentity, error)
 }
 
 type disabledGoogleProvider struct{}
@@ -52,10 +53,15 @@ func (disabledGoogleProvider) ExchangeCode(context.Context, string) (GoogleIdent
 	return GoogleIdentity{}, ErrGoogleNotConfigured
 }
 
+func (disabledGoogleProvider) VerifyIDToken(context.Context, string) (GoogleIdentity, error) {
+	return GoogleIdentity{}, ErrGoogleNotConfigured
+}
+
 type GoogleProviderConfig struct {
-	ClientID     string
-	ClientSecret string
-	RedirectURL  string
+	ClientID        string
+	ClientSecret    string
+	RedirectURL     string
+	DesktopClientID string
 }
 
 func NewGoogleProvider(cfg GoogleProviderConfig) GoogleProvider {
@@ -66,6 +72,7 @@ func NewGoogleProvider(cfg GoogleProviderConfig) GoogleProvider {
 		clientID:     strings.TrimSpace(cfg.ClientID),
 		clientSecret: strings.TrimSpace(cfg.ClientSecret),
 		redirectURL:  strings.TrimSpace(cfg.RedirectURL),
+		audiences:    googleAudiences(cfg.ClientID, cfg.DesktopClientID),
 		httpClient:   &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -74,6 +81,7 @@ type liveGoogleProvider struct {
 	clientID     string
 	clientSecret string
 	redirectURL  string
+	audiences    []string
 	httpClient   *http.Client
 }
 
@@ -130,10 +138,11 @@ func (p *liveGoogleProvider) ExchangeCode(ctx context.Context, code string) (Goo
 		return GoogleIdentity{}, fmt.Errorf("google response did not include id_token")
 	}
 
-	return p.verifyIDToken(ctx, tokenResponse.IDToken)
+	return p.VerifyIDToken(ctx, tokenResponse.IDToken)
 }
 
-func (p *liveGoogleProvider) verifyIDToken(ctx context.Context, rawToken string) (GoogleIdentity, error) {
+func (p *liveGoogleProvider) VerifyIDToken(ctx context.Context, rawToken string) (GoogleIdentity, error) {
+	rawToken = strings.TrimSpace(rawToken)
 	parts := strings.Split(rawToken, ".")
 	if len(parts) != 3 {
 		return GoogleIdentity{}, fmt.Errorf("invalid google id token format")
@@ -185,7 +194,7 @@ func (p *liveGoogleProvider) validateClaims(claims map[string]interface{}) error
 	if issuer != "accounts.google.com" && issuer != "https://accounts.google.com" {
 		return fmt.Errorf("unexpected google id token issuer %q", issuer)
 	}
-	if !claimAudienceMatches(claims["aud"], p.clientID) {
+	if !claimAudienceMatchesAny(claims["aud"], p.audiences) {
 		return fmt.Errorf("google id token audience mismatch")
 	}
 	if claimString(claims, "sub") == "" {
@@ -273,6 +282,29 @@ func claimAudienceMatches(raw interface{}, clientID string) bool {
 		}
 	}
 	return false
+}
+
+func claimAudienceMatchesAny(raw interface{}, clientIDs []string) bool {
+	for _, clientID := range clientIDs {
+		if strings.TrimSpace(clientID) != "" && claimAudienceMatches(raw, clientID) {
+			return true
+		}
+	}
+	return false
+}
+
+func googleAudiences(clientIDs ...string) []string {
+	audiences := make([]string, 0, len(clientIDs))
+	seen := map[string]bool{}
+	for _, clientID := range clientIDs {
+		clientID = strings.TrimSpace(clientID)
+		if clientID == "" || seen[clientID] {
+			continue
+		}
+		audiences = append(audiences, clientID)
+		seen[clientID] = true
+	}
+	return audiences
 }
 
 func parseCertificateKey(rawCert string) (*rsa.PublicKey, error) {

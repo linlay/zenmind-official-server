@@ -308,6 +308,59 @@ func TestGoogleCallbackCreatesSession(t *testing.T) {
 	}
 }
 
+func TestDesktopSSOSessionCreatesSessionFromGoogleIDToken(t *testing.T) {
+	handler, store := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"provider":"google","id_token":"desktop-id-token"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "test_session" || !cookies[0].HttpOnly {
+		t.Fatalf("unexpected desktop SSO cookies: %#v", cookies)
+	}
+
+	var body struct {
+		OK   bool           `json:"ok"`
+		User map[string]any `json:"user"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode desktop SSO response: %v", err)
+	}
+	if !body.OK || body.User["email"] != "desktop-user@example.com" {
+		t.Fatalf("unexpected desktop SSO response: %#v", body)
+	}
+
+	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	meReq.AddCookie(cookies[0])
+	meRec := httptest.NewRecorder()
+	handler.ServeHTTP(meRec, meReq)
+	if meRec.Code != http.StatusOK {
+		t.Fatalf("me status = %d body = %s", meRec.Code, meRec.Body.String())
+	}
+	if len(store.google) != 1 {
+		t.Fatalf("expected one google user, got %#v", store.google)
+	}
+}
+
+func TestDesktopSSOSessionRejectsInvalidGoogleIDToken(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"provider":"google","id_token":"invalid"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("invalid desktop SSO set cookies: %#v", rec.Result().Cookies())
+	}
+}
+
 func testHandler(t *testing.T) (http.Handler, *memoryStore) {
 	t.Helper()
 
@@ -360,6 +413,18 @@ func (fakeGoogleProvider) ExchangeCode(context.Context, string) (GoogleIdentity,
 		Email:   "google-user@example.com",
 		Name:    "Google User",
 		Picture: "https://example.com/avatar.png",
+	}, nil
+}
+
+func (fakeGoogleProvider) VerifyIDToken(_ context.Context, rawToken string) (GoogleIdentity, error) {
+	if rawToken != "desktop-id-token" {
+		return GoogleIdentity{}, context.Canceled
+	}
+	return GoogleIdentity{
+		Subject: "desktop-google-subject",
+		Email:   "desktop-user@example.com",
+		Name:    "Desktop User",
+		Picture: "https://example.com/desktop-avatar.png",
 	}, nil
 }
 

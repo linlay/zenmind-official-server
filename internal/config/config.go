@@ -17,6 +17,7 @@ type Config struct {
 	CookieSecure      bool
 	SessionTTL        time.Duration
 	GoogleClientID    string
+	GoogleDesktopID   string
 	GoogleSecret      string
 	GoogleRedirectURL string
 	AuthSuccessURL    string
@@ -35,6 +36,7 @@ func FromEnv() (Config, error) {
 		CookieSecure:      envBool("COOKIE_SECURE", false),
 		SessionTTL:        envDuration("SESSION_TTL", 24*time.Hour),
 		GoogleClientID:    os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleDesktopID:   os.Getenv("GOOGLE_DESKTOP_CLIENT_ID"),
 		GoogleSecret:      os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleRedirectURL: os.Getenv("GOOGLE_REDIRECT_URL"),
 		AuthSuccessURL:    env("AUTH_SUCCESS_URL", "http://localhost:5173/login"),

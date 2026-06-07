@@ -17,6 +17,7 @@ Go 1.26 backend for the ZenMind official site login flow.
 - `POST /api/auth/email-code/verify`
 - `GET /api/auth/google/start`
 - `GET /api/auth/google/callback`
+- `POST /api/auth/desktop-sso/session`
 - `GET /api/auth/me`
 - `POST /api/auth/logout`
 - `GET /api/downloads/stats`
@@ -38,6 +39,10 @@ Required values:
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
+
+Optional values:
+
+- `GOOGLE_DESKTOP_CLIENT_ID` when the desktop app uses a separate Google OAuth client id
 
 For Gmail delivery, set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USERNAME=linlay.zenmind@gmail.com`, `SMTP_FROM=linlay.zenmind@gmail.com`, and use a Google App Password as `SMTP_PASSWORD`. Do not use the normal Google account password.
 

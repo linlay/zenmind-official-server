@@ -83,6 +83,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/auth/google/start", s.googleStart)
 	mux.HandleFunc("GET /api/auth/google/callback", s.googleCallback)
 	mux.HandleFunc("GET /api/v1/auth/google/callback", s.googleCallback)
+	mux.HandleFunc("POST /api/auth/desktop-sso/session", s.desktopSsoSession)
 	mux.HandleFunc("GET /api/auth/me", s.me)
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
 	return securityHeaders(mux)
@@ -119,6 +120,11 @@ type emailCodeVerifyRequest struct {
 
 type downloadEventRequest struct {
 	InstallerKey string `json:"installerKey"`
+}
+
+type desktopSsoSessionRequest struct {
+	Provider string `json:"provider"`
+	IDToken  string `json:"id_token"`
 }
 
 var emailPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
@@ -361,6 +367,59 @@ func (s *Server) googleCallback(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
 	http.SetCookie(w, s.sessionCookie(token, expiresAt))
 	http.Redirect(w, r, s.successURL(), http.StatusFound)
+}
+
+func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
+	if !s.google.Configured() {
+		writeError(w, http.StatusServiceUnavailable, "google_not_configured", "Google login is not configured.")
+		return
+	}
+
+	var req desktopSsoSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid desktop SSO request.")
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	idToken := strings.TrimSpace(req.IDToken)
+	if provider != "google" || idToken == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Desktop SSO provider and id_token are required.")
+		return
+	}
+
+	identity, err := s.google.VerifyIDToken(r.Context(), idToken)
+	if err != nil {
+		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "invalid_token"})
+		writeError(w, http.StatusUnauthorized, "invalid_token", "Desktop SSO token is invalid.")
+		return
+	}
+
+	user, err := s.store.UpsertGoogleUser(r.Context(), identity, requestIP(r))
+	if err != nil {
+		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "user_upsert_failed"})
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save user account.")
+		return
+	}
+	if !user.Enabled {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "account_disabled"})
+		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+
+	token, expiresAt, err := s.createSession(r, user.ID)
+	if err != nil {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "session_create_failed"})
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
+		return
+	}
+
+	now := s.now().UTC()
+	_ = s.store.TouchLastLogin(r.Context(), user.ID, now)
+	user.LastLoginAt = &now
+	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "success"})
+
+	http.SetCookie(w, s.sessionCookie(token, expiresAt))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": publicUser(user)})
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {

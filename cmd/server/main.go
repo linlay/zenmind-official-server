@@ -48,9 +48,10 @@ func run() error {
 		CookieSecure: cfg.CookieSecure,
 		SessionTTL:   cfg.SessionTTL,
 		Google: auth.NewGoogleProvider(auth.GoogleProviderConfig{
-			ClientID:     cfg.GoogleClientID,
-			ClientSecret: cfg.GoogleSecret,
-			RedirectURL:  cfg.GoogleRedirectURL,
+			ClientID:        cfg.GoogleClientID,
+			ClientSecret:    cfg.GoogleSecret,
+			RedirectURL:     cfg.GoogleRedirectURL,
+			DesktopClientID: cfg.GoogleDesktopID,
 		}),
 		AuthSuccessURL: cfg.AuthSuccessURL,
 		AuthFailureURL: cfg.AuthFailureURL,
