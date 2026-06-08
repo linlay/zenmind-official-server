@@ -322,6 +322,192 @@ func TestGoogleCallbackCreatesSession(t *testing.T) {
 	}
 }
 
+func TestGoogleDesktopStartRejectsNonLoopbackCallback(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/google/desktop/start?callback=https%3A%2F%2Fexample.com%2Fapi%2Fauth%2Foidc%2Fcallback&state=desktop-state", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGoogleDesktopStartRedirectsAndSetsDesktopCookies(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	callbackURL := "http://127.0.0.1:43123/api/auth/oidc/callback"
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/google/desktop/start?callback="+url.QueryEscape(callbackURL)+"&state=desktop-state", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	parsed, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	if parsed.Scheme != "https" || parsed.Host != "accounts.example.test" || parsed.Path != "/auth" {
+		t.Fatalf("unexpected location %q", rec.Header().Get("Location"))
+	}
+
+	cookies := cookiesByName(rec.Result().Cookies())
+	oauthState := cookies["test_session_desktop_oauth_state"]
+	if oauthState == nil || oauthState.Value == "" || !oauthState.HttpOnly {
+		t.Fatalf("missing desktop oauth state cookie: %#v", rec.Result().Cookies())
+	}
+	if parsed.Query().Get("state") != oauthState.Value {
+		t.Fatalf("redirect state and cookie state differ")
+	}
+	if callback := cookies["test_session_desktop_oauth_callback"]; callback == nil || callback.Value != callbackURL || !callback.HttpOnly {
+		t.Fatalf("unexpected callback cookie: %#v", callback)
+	}
+	if desktopState := cookies["test_session_desktop_state"]; desktopState == nil || desktopState.Value != "desktop-state" || !desktopState.HttpOnly {
+		t.Fatalf("unexpected desktop state cookie: %#v", desktopState)
+	}
+}
+
+func TestGoogleDesktopCallbackCreatesTicketAndRedirectsToLoopback(t *testing.T) {
+	handler, store := testHandler(t)
+	callbackURL := "http://127.0.0.1:43123/api/auth/oidc/callback"
+	desktopState := "desktop-state"
+
+	startRec := startDesktopGoogleLogin(t, handler, callbackURL, desktopState)
+	googleState := googleStateFromRedirect(t, startRec)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/api/auth/google/callback?state="+url.QueryEscape(googleState)+"&code=test-code", nil)
+	for _, cookie := range startRec.Result().Cookies() {
+		callbackReq.AddCookie(cookie)
+	}
+	callbackRec := httptest.NewRecorder()
+	handler.ServeHTTP(callbackRec, callbackReq)
+
+	if callbackRec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", callbackRec.Code, callbackRec.Body.String())
+	}
+	location, err := url.Parse(callbackRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse desktop redirect: %v", err)
+	}
+	if location.Scheme != "http" || location.Host != "127.0.0.1:43123" || location.Path != "/api/auth/oidc/callback" {
+		t.Fatalf("unexpected desktop redirect %q", callbackRec.Header().Get("Location"))
+	}
+	if location.Query().Get("state") != desktopState {
+		t.Fatalf("unexpected desktop state %q", location.Query().Get("state"))
+	}
+	if location.Query().Get("ticket") == "" {
+		t.Fatalf("missing desktop ticket in %q", callbackRec.Header().Get("Location"))
+	}
+	for _, cookie := range callbackRec.Result().Cookies() {
+		if cookie.Name == "test_session" {
+			t.Fatalf("desktop callback must not set a web session cookie: %#v", callbackRec.Result().Cookies())
+		}
+	}
+	if len(store.tickets) != 1 {
+		t.Fatalf("expected one desktop ticket, got %#v", store.tickets)
+	}
+}
+
+func TestDesktopSSOSessionCreatesSessionFromTicket(t *testing.T) {
+	handler, _ := testHandler(t)
+	ticket := createDesktopTicketFromGoogleLogin(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"provider":"google","ticket":"`+ticket+`"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "test_session" || !cookies[0].HttpOnly {
+		t.Fatalf("unexpected desktop SSO cookies: %#v", cookies)
+	}
+}
+
+func TestDesktopSSOTicketCanOnlyBeConsumedOnce(t *testing.T) {
+	handler, _ := testHandler(t)
+	ticket := createDesktopTicketFromGoogleLogin(t, handler)
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"provider":"google","ticket":"`+ticket+`"}`))
+	firstRec := httptest.NewRecorder()
+	handler.ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first status = %d body = %s", firstRec.Code, firstRec.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"provider":"google","ticket":"`+ticket+`"}`))
+	secondRec := httptest.NewRecorder()
+	handler.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusUnauthorized {
+		t.Fatalf("second status = %d body = %s", secondRec.Code, secondRec.Body.String())
+	}
+}
+
+func TestDesktopSSOSessionRejectsExpiredTicket(t *testing.T) {
+	handler, store := testHandler(t)
+	user, err := store.UpsertGoogleUser(context.Background(), GoogleIdentity{
+		Subject: "expired-desktop-subject",
+		Email:   "expired@example.com",
+		Name:    "Expired User",
+	}, "")
+	if err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	ticket := "expired-ticket"
+	if err := store.SaveDesktopSsoTicket(context.Background(), user.ID, tokenHash(ticket), time.Now().UTC().Add(-time.Minute), "", ""); err != nil {
+		t.Fatalf("save ticket: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"provider":"google","ticket":"`+ticket+`"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGoogleDesktopCallbackDoesNotIssueTicketForDisabledUser(t *testing.T) {
+	handler, store := testHandler(t)
+	if _, err := store.UpsertGoogleUser(context.Background(), GoogleIdentity{
+		Subject: "google-subject",
+		Email:   "google-user@example.com",
+		Name:    "Google User",
+	}, ""); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	store.mu.Lock()
+	userID := store.google["google-subject"]
+	user := store.users[userID]
+	user.Enabled = false
+	store.users[userID] = user
+	store.mu.Unlock()
+
+	startRec := startDesktopGoogleLogin(t, handler, "http://127.0.0.1:43123/api/auth/oidc/callback", "desktop-state")
+	googleState := googleStateFromRedirect(t, startRec)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/api/auth/google/callback?state="+url.QueryEscape(googleState)+"&code=test-code", nil)
+	for _, cookie := range startRec.Result().Cookies() {
+		callbackReq.AddCookie(cookie)
+	}
+	callbackRec := httptest.NewRecorder()
+	handler.ServeHTTP(callbackRec, callbackReq)
+
+	if callbackRec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", callbackRec.Code, callbackRec.Body.String())
+	}
+	location, err := url.Parse(callbackRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	if location.Query().Get("error") != "account_disabled" || location.Query().Get("ticket") != "" {
+		t.Fatalf("unexpected disabled user redirect %q", callbackRec.Header().Get("Location"))
+	}
+	if len(store.tickets) != 0 {
+		t.Fatalf("disabled user should not receive ticket: %#v", store.tickets)
+	}
+}
+
 func TestDesktopSSOSessionCreatesSessionFromGoogleIDToken(t *testing.T) {
 	handler, store := testHandler(t)
 
@@ -409,6 +595,69 @@ func testHandlerWithMailer(t *testing.T) (http.Handler, *memoryStore, *fakeMaile
 		Mailer:         mailer,
 	})
 	return server.Routes(), store, mailer
+}
+
+func cookiesByName(cookies []*http.Cookie) map[string]*http.Cookie {
+	result := map[string]*http.Cookie{}
+	for _, cookie := range cookies {
+		result[cookie.Name] = cookie
+	}
+	return result
+}
+
+func startDesktopGoogleLogin(t *testing.T, handler http.Handler, callbackURL, desktopState string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/auth/google/desktop/start?callback="+url.QueryEscape(callbackURL)+"&state="+url.QueryEscape(desktopState),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("desktop start status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	return rec
+}
+
+func googleStateFromRedirect(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+
+	parsed, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse google redirect: %v", err)
+	}
+	state := parsed.Query().Get("state")
+	if state == "" {
+		t.Fatalf("missing google state in %q", rec.Header().Get("Location"))
+	}
+	return state
+}
+
+func createDesktopTicketFromGoogleLogin(t *testing.T, handler http.Handler) string {
+	t.Helper()
+
+	startRec := startDesktopGoogleLogin(t, handler, "http://127.0.0.1:43123/api/auth/oidc/callback", "desktop-state")
+	googleState := googleStateFromRedirect(t, startRec)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/api/auth/google/callback?state="+url.QueryEscape(googleState)+"&code=test-code", nil)
+	for _, cookie := range startRec.Result().Cookies() {
+		callbackReq.AddCookie(cookie)
+	}
+	callbackRec := httptest.NewRecorder()
+	handler.ServeHTTP(callbackRec, callbackReq)
+	if callbackRec.Code != http.StatusFound {
+		t.Fatalf("desktop callback status = %d body = %s", callbackRec.Code, callbackRec.Body.String())
+	}
+	location, err := url.Parse(callbackRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse desktop callback redirect: %v", err)
+	}
+	ticket := location.Query().Get("ticket")
+	if ticket == "" {
+		t.Fatalf("missing desktop ticket in %q", callbackRec.Header().Get("Location"))
+	}
+	return ticket
 }
 
 type fakeGoogleProvider struct{}

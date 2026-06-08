@@ -20,25 +20,27 @@ import (
 )
 
 type Server struct {
-	store          Store
-	cookieName     string
-	cookieSecure   bool
-	sessionTTL     time.Duration
-	google         GoogleProvider
-	authSuccessURL string
-	authFailureURL string
-	mailer         Mailer
-	now            func() time.Time
+	store            Store
+	cookieName       string
+	cookieSecure     bool
+	sessionTTL       time.Duration
+	google           GoogleProvider
+	authSuccessURL   string
+	authFailureURL   string
+	desktopTicketTTL time.Duration
+	mailer           Mailer
+	now              func() time.Time
 }
 
 type ServerOptions struct {
-	CookieName     string
-	CookieSecure   bool
-	SessionTTL     time.Duration
-	Google         GoogleProvider
-	AuthSuccessURL string
-	AuthFailureURL string
-	Mailer         Mailer
+	CookieName       string
+	CookieSecure     bool
+	SessionTTL       time.Duration
+	Google           GoogleProvider
+	AuthSuccessURL   string
+	AuthFailureURL   string
+	DesktopTicketTTL time.Duration
+	Mailer           Mailer
 }
 
 func NewServer(store Store, opts ServerOptions) *Server {
@@ -50,6 +52,10 @@ func NewServer(store Store, opts ServerOptions) *Server {
 	if sessionTTL <= 0 {
 		sessionTTL = 24 * time.Hour
 	}
+	desktopTicketTTL := opts.DesktopTicketTTL
+	if desktopTicketTTL <= 0 {
+		desktopTicketTTL = 2 * time.Minute
+	}
 	google := opts.Google
 	if google == nil {
 		google = disabledGoogleProvider{}
@@ -60,15 +66,16 @@ func NewServer(store Store, opts ServerOptions) *Server {
 	}
 
 	return &Server{
-		store:          store,
-		cookieName:     cookieName,
-		cookieSecure:   opts.CookieSecure,
-		sessionTTL:     sessionTTL,
-		google:         google,
-		authSuccessURL: strings.TrimSpace(opts.AuthSuccessURL),
-		authFailureURL: strings.TrimSpace(opts.AuthFailureURL),
-		mailer:         mailer,
-		now:            time.Now,
+		store:            store,
+		cookieName:       cookieName,
+		cookieSecure:     opts.CookieSecure,
+		sessionTTL:       sessionTTL,
+		google:           google,
+		authSuccessURL:   strings.TrimSpace(opts.AuthSuccessURL),
+		authFailureURL:   strings.TrimSpace(opts.AuthFailureURL),
+		desktopTicketTTL: desktopTicketTTL,
+		mailer:           mailer,
+		now:              time.Now,
 	}
 }
 
@@ -83,6 +90,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/auth/google/start", s.googleStart)
 	mux.HandleFunc("GET /api/auth/google/callback", s.googleCallback)
 	mux.HandleFunc("GET /api/v1/auth/google/callback", s.googleCallback)
+	mux.HandleFunc("GET /api/auth/google/desktop/start", s.googleDesktopStart)
 	mux.HandleFunc("POST /api/auth/desktop-sso/session", s.desktopSsoSession)
 	mux.HandleFunc("GET /api/auth/me", s.me)
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
@@ -126,9 +134,16 @@ type downloadEventRequest struct {
 type desktopSsoSessionRequest struct {
 	Provider string `json:"provider"`
 	IDToken  string `json:"id_token"`
+	Ticket   string `json:"ticket"`
 }
 
 var emailPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+
+type desktopOAuthContext struct {
+	OAuthState   string
+	CallbackURL  string
+	DesktopState string
+}
 
 var allowedInstallerKeys = map[string]bool{
 	"mac":     true,
@@ -314,7 +329,44 @@ func (s *Server) googleStart(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, s.google.AuthCodeURL(state), http.StatusFound)
 }
 
+func (s *Server) googleDesktopStart(w http.ResponseWriter, r *http.Request) {
+	if !s.google.Configured() {
+		writeError(w, http.StatusServiceUnavailable, "google_not_configured", "Google login is not configured.")
+		return
+	}
+
+	callbackURL := strings.TrimSpace(r.URL.Query().Get("callback"))
+	desktopState := strings.TrimSpace(r.URL.Query().Get("state"))
+	if !isAllowedDesktopCallbackURL(callbackURL) || desktopState == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Desktop callback and state are required.")
+		return
+	}
+
+	oauthState, err := randomToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to start Google login.")
+		return
+	}
+
+	http.SetCookie(w, s.desktopOAuthCookie(s.desktopOAuthStateCookieName(), oauthState))
+	http.SetCookie(w, s.desktopOAuthCookie(s.desktopOAuthCallbackCookieName(), callbackURL))
+	http.SetCookie(w, s.desktopOAuthCookie(s.desktopOAuthDesktopStateCookieName(), desktopState))
+	http.Redirect(w, r, s.google.AuthCodeURL(oauthState), http.StatusFound)
+}
+
 func (s *Server) googleCallback(w http.ResponseWriter, r *http.Request) {
+	desktopContext, hasDesktopContext, desktopContextErr := s.readDesktopOAuthContext(r)
+	if hasDesktopContext {
+		if desktopContextErr != nil {
+			s.clearDesktopOAuthCookies(w)
+			s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "invalid_desktop_oauth_context"})
+			s.redirectFailure(w, r, "invalid_desktop_oauth_context")
+			return
+		}
+		s.googleDesktopCallback(w, r, desktopContext)
+		return
+	}
+
 	stateCookie, err := r.Cookie(s.oauthStateCookieName())
 	if err != nil || stateCookie.Value == "" {
 		s.recordLogin(r, LoginLog{AuthMethod: "google", LoginResult: "failure", FailureReason: "missing_state"})
@@ -375,12 +427,65 @@ func (s *Server) googleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, s.successURL(), http.StatusFound)
 }
 
-func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
-	if !s.google.Configured() {
-		writeError(w, http.StatusServiceUnavailable, "google_not_configured", "Google login is not configured.")
+func (s *Server) googleDesktopCallback(w http.ResponseWriter, r *http.Request, desktopContext desktopOAuthContext) {
+	if desktopContext.OAuthState != r.URL.Query().Get("state") {
+		s.clearDesktopOAuthCookies(w)
+		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "invalid_state"})
+		s.redirectDesktopFailure(w, r, desktopContext, "invalid_state")
 		return
 	}
 
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		s.clearDesktopOAuthCookies(w)
+		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "missing_code"})
+		s.redirectDesktopFailure(w, r, desktopContext, "missing_code")
+		return
+	}
+
+	identity, err := s.google.ExchangeCode(r.Context(), code)
+	if err != nil {
+		s.clearDesktopOAuthCookies(w)
+		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "exchange_failed"})
+		s.redirectDesktopFailure(w, r, desktopContext, "google_exchange_failed")
+		return
+	}
+
+	user, err := s.store.UpsertGoogleUser(r.Context(), identity, requestIP(r))
+	if err != nil {
+		s.clearDesktopOAuthCookies(w)
+		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "user_upsert_failed"})
+		s.redirectDesktopFailure(w, r, desktopContext, "google_user_failed")
+		return
+	}
+	if !user.Enabled {
+		s.clearDesktopOAuthCookies(w)
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "account_disabled"})
+		s.redirectDesktopFailure(w, r, desktopContext, "account_disabled")
+		return
+	}
+
+	ticket, err := randomToken()
+	if err != nil {
+		s.clearDesktopOAuthCookies(w)
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "ticket_create_failed"})
+		s.redirectDesktopFailure(w, r, desktopContext, "desktop_ticket_failed")
+		return
+	}
+	expiresAt := s.now().UTC().Add(s.desktopTicketTTL)
+	if err := s.store.SaveDesktopSsoTicket(r.Context(), user.ID, tokenHash(ticket), expiresAt, requestIP(r), r.UserAgent()); err != nil {
+		s.clearDesktopOAuthCookies(w)
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "ticket_save_failed"})
+		s.redirectDesktopFailure(w, r, desktopContext, "desktop_ticket_failed")
+		return
+	}
+
+	s.clearDesktopOAuthCookies(w)
+	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "success"})
+	s.redirectDesktopSuccess(w, r, desktopContext, ticket)
+}
+
+func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
 	var req desktopSsoSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid desktop SSO request.")
@@ -388,8 +493,21 @@ func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
 	}
 	provider := strings.ToLower(strings.TrimSpace(req.Provider))
 	idToken := strings.TrimSpace(req.IDToken)
-	if provider != "google" || idToken == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "Desktop SSO provider and id_token are required.")
+	ticket := strings.TrimSpace(req.Ticket)
+	if provider != "google" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Desktop SSO provider is required.")
+		return
+	}
+	if ticket != "" {
+		s.desktopSsoTicketSession(w, r, ticket)
+		return
+	}
+	if !s.google.Configured() {
+		writeError(w, http.StatusServiceUnavailable, "google_not_configured", "Google login is not configured.")
+		return
+	}
+	if idToken == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Desktop SSO id_token or ticket is required.")
 		return
 	}
 
@@ -409,6 +527,39 @@ func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
 	if !user.Enabled {
 		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "account_disabled"})
 		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+
+	token, expiresAt, err := s.createSession(r, user.ID)
+	if err != nil {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "session_create_failed"})
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
+		return
+	}
+
+	now := s.now().UTC()
+	_ = s.store.TouchLastLogin(r.Context(), user.ID, now)
+	user.LastLoginAt = &now
+	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "success"})
+
+	http.SetCookie(w, s.sessionCookie(token, expiresAt))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": publicUser(user)})
+}
+
+func (s *Server) desktopSsoTicketSession(w http.ResponseWriter, r *http.Request, ticket string) {
+	user, err := s.store.ConsumeDesktopSsoTicket(r.Context(), tokenHash(ticket), s.now().UTC())
+	if errors.Is(err, ErrNotFound) {
+		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "invalid_ticket"})
+		writeError(w, http.StatusUnauthorized, "invalid_ticket", "Desktop SSO ticket is invalid or expired.")
+		return
+	}
+	if errors.Is(err, ErrDisabledUser) {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "account_disabled"})
+		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read desktop SSO ticket.")
 		return
 	}
 
@@ -531,6 +682,100 @@ func (s *Server) oauthStateCookie(state string) *http.Cookie {
 		Secure:   s.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
 	}
+}
+
+func (s *Server) desktopOAuthStateCookieName() string {
+	return s.cookieName + "_desktop_oauth_state"
+}
+
+func (s *Server) desktopOAuthCallbackCookieName() string {
+	return s.cookieName + "_desktop_oauth_callback"
+}
+
+func (s *Server) desktopOAuthDesktopStateCookieName() string {
+	return s.cookieName + "_desktop_state"
+}
+
+func (s *Server) desktopOAuthCookie(name, value string) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		Expires:  s.now().UTC().Add(10 * time.Minute),
+		MaxAge:   int((10 * time.Minute).Seconds()),
+		HttpOnly: true,
+		Secure:   s.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+func (s *Server) clearDesktopOAuthCookies(w http.ResponseWriter) {
+	http.SetCookie(w, s.expiredNamedCookie(s.desktopOAuthStateCookieName()))
+	http.SetCookie(w, s.expiredNamedCookie(s.desktopOAuthCallbackCookieName()))
+	http.SetCookie(w, s.expiredNamedCookie(s.desktopOAuthDesktopStateCookieName()))
+}
+
+func (s *Server) readDesktopOAuthContext(r *http.Request) (desktopOAuthContext, bool, error) {
+	oauthStateCookie, oauthStateErr := r.Cookie(s.desktopOAuthStateCookieName())
+	callbackCookie, callbackErr := r.Cookie(s.desktopOAuthCallbackCookieName())
+	desktopStateCookie, desktopStateErr := r.Cookie(s.desktopOAuthDesktopStateCookieName())
+	if oauthStateErr != nil && callbackErr != nil && desktopStateErr != nil {
+		return desktopOAuthContext{}, false, nil
+	}
+	if oauthStateErr != nil || callbackErr != nil || desktopStateErr != nil {
+		return desktopOAuthContext{}, true, fmt.Errorf("missing desktop oauth cookie")
+	}
+	context := desktopOAuthContext{
+		OAuthState:   strings.TrimSpace(oauthStateCookie.Value),
+		CallbackURL:  strings.TrimSpace(callbackCookie.Value),
+		DesktopState: strings.TrimSpace(desktopStateCookie.Value),
+	}
+	if context.OAuthState == "" || context.DesktopState == "" || !isAllowedDesktopCallbackURL(context.CallbackURL) {
+		return desktopOAuthContext{}, true, fmt.Errorf("invalid desktop oauth cookie")
+	}
+	return context, true, nil
+}
+
+func isAllowedDesktopCallbackURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	if parsed.Scheme != "http" || parsed.Hostname() != "127.0.0.1" || parsed.Port() == "" {
+		return false
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port <= 0 || port > 65535 {
+		return false
+	}
+	if parsed.Path != "/api/auth/oidc/callback" {
+		return false
+	}
+	return parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == ""
+}
+
+func buildDesktopCallbackURL(desktopContext desktopOAuthContext, values map[string]string) string {
+	target, err := url.Parse(desktopContext.CallbackURL)
+	if err != nil {
+		return desktopContext.CallbackURL
+	}
+	query := target.Query()
+	query.Set("state", desktopContext.DesktopState)
+	for key, value := range values {
+		if strings.TrimSpace(value) != "" {
+			query.Set(key, value)
+		}
+	}
+	target.RawQuery = query.Encode()
+	return target.String()
+}
+
+func (s *Server) redirectDesktopSuccess(w http.ResponseWriter, r *http.Request, desktopContext desktopOAuthContext, ticket string) {
+	http.Redirect(w, r, buildDesktopCallbackURL(desktopContext, map[string]string{"ticket": ticket}), http.StatusFound)
+}
+
+func (s *Server) redirectDesktopFailure(w http.ResponseWriter, r *http.Request, desktopContext desktopOAuthContext, reason string) {
+	http.Redirect(w, r, buildDesktopCallbackURL(desktopContext, map[string]string{"error": reason}), http.StatusFound)
 }
 
 func (s *Server) successURL() string {

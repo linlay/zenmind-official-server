@@ -13,6 +13,7 @@ type memoryStore struct {
 	local    map[string]int64
 	google   map[string]int64
 	email    map[string]int64
+	tickets  map[string]desktopSsoTicketRecord
 	sessions map[string]sessionRecord
 	logins   []LoginLog
 	codes    []emailCodeRecord
@@ -24,6 +25,12 @@ type sessionRecord struct {
 	userID    int64
 	expiresAt time.Time
 	revoked   bool
+}
+
+type desktopSsoTicketRecord struct {
+	userID     int64
+	expiresAt  time.Time
+	consumedAt *time.Time
 }
 
 type emailCodeRecord struct {
@@ -40,6 +47,7 @@ func newMemoryStore() *memoryStore {
 		local:    map[string]int64{},
 		google:   map[string]int64{},
 		email:    map[string]int64{},
+		tickets:  map[string]desktopSsoTicketRecord{},
 		sessions: map[string]sessionRecord{},
 		stats:    map[string]int64{},
 	}
@@ -130,8 +138,12 @@ func (s *memoryStore) UpsertGoogleUser(_ context.Context, identity GoogleIdentit
 	user.AvatarURL = identity.Picture
 	user.AuthProvider = "google"
 	user.AuthSub = subject
-	user.Role = "user"
-	user.Enabled = true
+	if !exists || user.Role == "" {
+		user.Role = "user"
+	}
+	if !exists {
+		user.Enabled = true
+	}
 	s.users[userID] = user
 	return user, nil
 }
@@ -210,6 +222,39 @@ func (s *memoryStore) RevokeSession(_ context.Context, tokenHash string) error {
 		s.sessions[tokenHash] = session
 	}
 	return nil
+}
+
+func (s *memoryStore) SaveDesktopSsoTicket(_ context.Context, userID int64, ticketHash string, expiresAt time.Time, _, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.tickets[ticketHash] = desktopSsoTicketRecord{
+		userID:    userID,
+		expiresAt: expiresAt,
+	}
+	return nil
+}
+
+func (s *memoryStore) ConsumeDesktopSsoTicket(_ context.Context, ticketHash string, now time.Time) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ticket, ok := s.tickets[ticketHash]
+	if !ok || ticket.consumedAt != nil || !ticket.expiresAt.After(now) {
+		return User{}, ErrNotFound
+	}
+	consumedAt := now
+	ticket.consumedAt = &consumedAt
+	s.tickets[ticketHash] = ticket
+
+	user, ok := s.users[ticket.userID]
+	if !ok {
+		return User{}, ErrNotFound
+	}
+	if !user.Enabled {
+		return user, ErrDisabledUser
+	}
+	return user, nil
 }
 
 func (s *memoryStore) TouchLastLogin(_ context.Context, userID int64, loggedInAt time.Time) error {

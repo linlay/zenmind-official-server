@@ -54,12 +54,12 @@ type DownloadStat struct {
 }
 
 type DownloadEvent struct {
-	ID            int64     `json:"id"`
-	InstallerKey  string    `json:"installerKey"`
-	Version       string    `json:"version"`
-	IP            string    `json:"ip"`
-	UserAgent     string    `json:"userAgent"`
-	DownloadedAt  time.Time `json:"downloadedAt"`
+	ID           int64     `json:"id"`
+	InstallerKey string    `json:"installerKey"`
+	Version      string    `json:"version"`
+	IP           string    `json:"ip"`
+	UserAgent    string    `json:"userAgent"`
+	DownloadedAt time.Time `json:"downloadedAt"`
 }
 
 type Store interface {
@@ -73,6 +73,8 @@ type Store interface {
 	ConsumeEmailCode(ctx context.Context, email, codeHash string, now time.Time) error
 	CreateSession(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time, userAgent, ip string) error
 	RevokeSession(ctx context.Context, tokenHash string) error
+	SaveDesktopSsoTicket(ctx context.Context, userID int64, ticketHash string, expiresAt time.Time, ip, userAgent string) error
+	ConsumeDesktopSsoTicket(ctx context.Context, ticketHash string, now time.Time) (User, error)
 	TouchLastLogin(ctx context.Context, userID int64, loggedInAt time.Time) error
 	RecordLogin(ctx context.Context, entry LoginLog) error
 	ListDownloadStats(ctx context.Context) ([]DownloadStat, error)
@@ -142,6 +144,21 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 			UNIQUE KEY UK_AUTH_SESSION_TOKEN_HASH (TOKEN_HASH_),
 			KEY IDX_AUTH_SESSION_USER_EXPIRES (USER_ID_, EXPIRES_AT_),
 			CONSTRAINT FK_AUTH_SESSION_USER FOREIGN KEY (USER_ID_) REFERENCES auth_user (ID_) ON DELETE CASCADE
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS auth_desktop_sso_ticket (
+			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			USER_ID_ BIGINT UNSIGNED NOT NULL,
+			TICKET_HASH_ CHAR(64) NOT NULL,
+			EXPIRES_AT_ DATETIME(3) NOT NULL,
+			CONSUMED_AT_ DATETIME(3) NULL,
+			CREATED_AT_ DATETIME(3) NOT NULL,
+			IP_ VARCHAR(64) NOT NULL DEFAULT '',
+			USER_AGENT_ VARCHAR(512) NOT NULL DEFAULT '',
+			PRIMARY KEY (ID_),
+			UNIQUE KEY UK_AUTH_DESKTOP_SSO_TICKET_HASH (TICKET_HASH_),
+			KEY IDX_AUTH_DESKTOP_SSO_TICKET_EXPIRES (EXPIRES_AT_),
+			KEY IDX_AUTH_DESKTOP_SSO_TICKET_USER (USER_ID_),
+			CONSTRAINT FK_AUTH_DESKTOP_SSO_TICKET_USER FOREIGN KEY (USER_ID_) REFERENCES auth_user (ID_) ON DELETE CASCADE
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS auth_login_log (
 			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -438,6 +455,71 @@ func (s *MySQLStore) CreateSession(ctx context.Context, userID int64, tokenHash 
 func (s *MySQLStore) RevokeSession(ctx context.Context, tokenHash string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM auth_session WHERE TOKEN_HASH_ = ?`, tokenHash)
 	return err
+}
+
+func (s *MySQLStore) SaveDesktopSsoTicket(ctx context.Context, userID int64, ticketHash string, expiresAt time.Time, ip, userAgent string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO auth_desktop_sso_ticket (USER_ID_, TICKET_HASH_, EXPIRES_AT_, CREATED_AT_, IP_, USER_AGENT_)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		userID,
+		ticketHash,
+		expiresAt,
+		now,
+		truncate(strings.TrimSpace(ip), 64),
+		truncate(strings.TrimSpace(userAgent), 512),
+	)
+	return err
+}
+
+func (s *MySQLStore) ConsumeDesktopSsoTicket(ctx context.Context, ticketHash string, now time.Time) (User, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return User{}, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE auth_desktop_sso_ticket
+		 SET CONSUMED_AT_ = ?
+		 WHERE TICKET_HASH_ = ? AND CONSUMED_AT_ IS NULL AND EXPIRES_AT_ > ?`,
+		now,
+		ticketHash,
+		now,
+	)
+	if err != nil {
+		return User{}, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return User{}, err
+	}
+	if rowsAffected == 0 {
+		return User{}, ErrNotFound
+	}
+
+	row := tx.QueryRowContext(
+		ctx,
+		userSelectList+`
+		 , '' AS PASSWORD_HASH_
+		 FROM auth_desktop_sso_ticket ticket
+		 INNER JOIN auth_user u ON u.ID_ = ticket.USER_ID_
+		 WHERE ticket.TICKET_HASH_ = ?`,
+		ticketHash,
+	)
+	user, err := scanUserWithPassword(row)
+	if err != nil {
+		return user, err
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, err
+	}
+	if !user.Enabled {
+		return user, ErrDisabledUser
+	}
+	return user, nil
 }
 
 func (s *MySQLStore) TouchLastLogin(ctx context.Context, userID int64, loggedInAt time.Time) error {

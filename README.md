@@ -17,6 +17,7 @@ Go 1.26 backend for the ZenMind official site login flow.
 - `POST /api/auth/email-code/verify`
 - `GET /api/auth/google/start`
 - `GET /api/auth/google/callback`
+- `GET /api/auth/google/desktop/start`
 - `POST /api/auth/desktop-sso/session`
 - `GET /api/auth/me`
 - `POST /api/auth/logout`
