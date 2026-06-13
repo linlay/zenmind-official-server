@@ -48,6 +48,13 @@ func TestUpsertFileCopiesInstallerAndWritesCatalog(t *testing.T) {
 	if installer.SizeBytes != int64(len(sourceContent)) || installer.SHA256 != expectedSHA {
 		t.Fatalf("unexpected metadata: %#v", installer)
 	}
+	targetInfo, err := os.Stat(targetPath)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if targetInfo.Mode().Perm() != 0o644 {
+		t.Fatalf("target mode = %o, want 644", targetInfo.Mode().Perm())
+	}
 }
 
 func TestUpsertFileRejectsConflictingTargetWithoutReplace(t *testing.T) {
@@ -92,6 +99,42 @@ func TestUpsertFileRejectsConflictingTargetWithoutReplace(t *testing.T) {
 	}
 	if installer.SizeBytes != int64(len("new-content")) {
 		t.Fatalf("unexpected replacement installer: %#v", installer)
+	}
+}
+
+func TestUpsertFileRepairsExistingFileMode(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	sourcePath := filepath.Join(tempDir, "source.dmg")
+	sourceContent := []byte("same-content")
+	if err := os.WriteFile(sourcePath, sourceContent, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	targetDir := filepath.Join(tempDir, "releases", "desktop", "0.2.4")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	targetPath := filepath.Join(targetDir, "ZenMind-macOS-arm64.dmg")
+	if err := os.WriteFile(targetPath, sourceContent, 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	if _, err := UpsertFile(ctx, UpsertFileOptions{
+		DBPath:      filepath.Join(tempDir, "installers.sqlite"),
+		ReleaseRoot: filepath.Join(tempDir, "releases"),
+		Key:         "mac",
+		Version:     "0.2.4",
+		Source:      sourcePath,
+		FileName:    "ZenMind-macOS-arm64.dmg",
+	}); err != nil {
+		t.Fatalf("upsert existing file: %v", err)
+	}
+	targetInfo, err := os.Stat(targetPath)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if targetInfo.Mode().Perm() != 0o644 {
+		t.Fatalf("target mode = %o, want 644", targetInfo.Mode().Perm())
 	}
 }
 

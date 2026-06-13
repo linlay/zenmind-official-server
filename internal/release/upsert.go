@@ -83,6 +83,9 @@ func UpsertFile(ctx context.Context, opts UpsertFileOptions) (Installer, error) 
 	} else {
 		return Installer{}, err
 	}
+	if err := os.Chmod(targetPath, 0o644); err != nil {
+		return Installer{}, err
+	}
 
 	targetInfo, err := os.Stat(targetPath)
 	if err != nil {
