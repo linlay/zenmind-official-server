@@ -53,8 +53,10 @@ func run() error {
 			RedirectURL:     cfg.GoogleRedirectURL,
 			DesktopClientID: cfg.GoogleDesktopID,
 		}),
-		AuthSuccessURL: cfg.AuthSuccessURL,
-		AuthFailureURL: cfg.AuthFailureURL,
+		AuthSuccessURL:   cfg.AuthSuccessURL,
+		AuthFailureURL:   cfg.AuthFailureURL,
+		MarketServerURL:  cfg.MarketServerURL,
+		MarketProxyToken: cfg.MarketProxyToken,
 		Mailer: auth.NewSMTPMailer(auth.SMTPMailerConfig{
 			Host:     cfg.SMTPHost,
 			Port:     cfg.SMTPPort,

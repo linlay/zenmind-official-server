@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,6 +28,8 @@ type Config struct {
 	SMTPUsername      string
 	SMTPPassword      string
 	SMTPFrom          string
+	MarketServerURL   string
+	MarketProxyToken  string
 }
 
 func FromEnv() (Config, error) {
@@ -46,6 +49,8 @@ func FromEnv() (Config, error) {
 		SMTPUsername:      env("SMTP_USERNAME", "linlay.zenmind@gmail.com"),
 		SMTPPassword:      os.Getenv("SMTP_PASSWORD"),
 		SMTPFrom:          env("SMTP_FROM", "linlay.zenmind@gmail.com"),
+		MarketServerURL:   strings.TrimRight(env("MARKET_SERVER_URL", "http://zenmind-market-server:8088"), "/"),
+		MarketProxyToken:  os.Getenv("MARKET_PROXY_TOKEN"),
 	}
 
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")

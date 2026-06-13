@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -28,6 +29,8 @@ type Server struct {
 	authSuccessURL   string
 	authFailureURL   string
 	desktopTicketTTL time.Duration
+	marketServerURL  string
+	marketProxyToken string
 	mailer           Mailer
 	now              func() time.Time
 }
@@ -40,6 +43,8 @@ type ServerOptions struct {
 	AuthSuccessURL   string
 	AuthFailureURL   string
 	DesktopTicketTTL time.Duration
+	MarketServerURL  string
+	MarketProxyToken string
 	Mailer           Mailer
 }
 
@@ -74,6 +79,8 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		authSuccessURL:   strings.TrimSpace(opts.AuthSuccessURL),
 		authFailureURL:   strings.TrimSpace(opts.AuthFailureURL),
 		desktopTicketTTL: desktopTicketTTL,
+		marketServerURL:  strings.TrimRight(strings.TrimSpace(opts.MarketServerURL), "/"),
+		marketProxyToken: strings.TrimSpace(opts.MarketProxyToken),
 		mailer:           mailer,
 		now:              time.Now,
 	}
@@ -94,6 +101,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/desktop-sso/session", s.desktopSsoSession)
 	mux.HandleFunc("GET /api/auth/me", s.me)
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
+	mux.HandleFunc("/api/market/admin/", s.marketAdminProxy)
 	return securityHeaders(mux)
 }
 
@@ -613,6 +621,62 @@ func (s *Server) currentUser(r *http.Request) (User, error) {
 	return s.store.FindUserBySession(r.Context(), tokenHash(cookie.Value), s.now().UTC())
 }
 
+func (s *Server) marketAdminProxy(w http.ResponseWriter, r *http.Request) {
+	if s.marketServerURL == "" || s.marketProxyToken == "" {
+		writeError(w, http.StatusServiceUnavailable, "market_not_configured", "Market admin proxy is not configured.")
+		return
+	}
+	user, err := s.currentUser(r)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
+		return
+	}
+	if errors.Is(err, ErrDisabledUser) {
+		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read session.")
+		return
+	}
+	if strings.ToLower(user.Role) != "admin" {
+		writeError(w, http.StatusForbidden, "forbidden", "Admin role required.")
+		return
+	}
+
+	target, err := url.Parse(s.marketServerURL)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "market_not_configured", "Market server URL is invalid.")
+		return
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		suffix := strings.TrimPrefix(r.URL.Path, "/api/market/admin")
+		if suffix == "" {
+			suffix = "/"
+		}
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = singleJoiningSlash(target.Path, "/api/v1/admin"+suffix)
+		req.URL.RawQuery = r.URL.RawQuery
+		req.Host = target.Host
+		req.Header.Del("X-ZenMind-User-ID")
+		req.Header.Del("X-ZenMind-User-Email")
+		req.Header.Del("X-ZenMind-User-Role")
+		req.Header.Del("X-ZenMind-Market-Proxy-Token")
+		req.Header.Set("X-ZenMind-User-ID", strconv.FormatInt(user.ID, 10))
+		req.Header.Set("X-ZenMind-User-Email", user.Email)
+		req.Header.Set("X-ZenMind-User-Role", user.Role)
+		req.Header.Set("X-ZenMind-Market-Proxy-Token", s.marketProxyToken)
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
+		writeError(w, http.StatusBadGateway, "market_proxy_failed", proxyErr.Error())
+	}
+	proxy.ServeHTTP(w, r)
+}
+
 func (s *Server) createSession(r *http.Request, userID int64) (string, time.Time, error) {
 	token, err := randomToken()
 	if err != nil {
@@ -651,6 +715,19 @@ func (s *Server) expiredNamedCookie(name string) *http.Cookie {
 		HttpOnly: true,
 		Secure:   s.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+func singleJoiningSlash(left, right string) string {
+	leftSlash := strings.HasSuffix(left, "/")
+	rightSlash := strings.HasPrefix(right, "/")
+	switch {
+	case leftSlash && rightSlash:
+		return left + right[1:]
+	case !leftSlash && !rightSlash:
+		return left + "/" + right
+	default:
+		return left + right
 	}
 }
 
