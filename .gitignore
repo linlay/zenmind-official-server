@@ -1,5 +1,7 @@
 .env
 bin
 tmp
+data/*
+!data/.gitkeep
 *.log
 .DS_Store

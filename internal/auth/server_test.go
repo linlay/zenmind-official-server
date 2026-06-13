@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	"github.com/linlay/zenmind-official-server/internal/release"
 )
 
 func TestEnsureInitialAdminIsIdempotent(t *testing.T) {
@@ -230,6 +232,61 @@ func TestDownloadEventRejectsUnknownInstaller(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestInstallersReturnsCatalogEntries(t *testing.T) {
+	server := NewServer(newMemoryStore(), ServerOptions{
+		InstallerCatalog: staticInstallerCatalog{
+			installers: []release.Installer{
+				{
+					Key:       "windows",
+					Available: true,
+					Version:   "0.2.4",
+					Href:      "/install/releases/desktop/0.2.4/ZenMind-0.2.4-x64.exe",
+					FileName:  "ZenMind-0.2.4-x64.exe",
+					SizeBytes: 123,
+					SHA256:    "abc123",
+					UpdatedAt: time.Date(2026, 6, 13, 1, 2, 3, 0, time.UTC),
+				},
+				{
+					Key:       "linux",
+					Available: true,
+					Version:   "0.2.4",
+					Href:      "/install/releases/desktop/0.2.4/ZenMind-linux.AppImage",
+					FileName:  "ZenMind-linux.AppImage",
+					UpdatedAt: time.Date(2026, 6, 13, 1, 2, 3, 0, time.UTC),
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/installers", nil)
+	rec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Installers []release.Installer `json:"installers"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode installers: %v", err)
+	}
+	if len(body.Installers) != 1 || body.Installers[0].Key != "windows" || body.Installers[0].Version != "0.2.4" {
+		t.Fatalf("unexpected installers: %#v", body.Installers)
+	}
+}
+
+func TestInstallersReturnsServiceUnavailableWhenCatalogFails(t *testing.T) {
+	server := NewServer(newMemoryStore(), ServerOptions{InstallerCatalog: failingInstallerCatalog{}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/installers", nil)
+	rec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
@@ -694,6 +751,20 @@ func (fakeGoogleProvider) VerifyIDToken(_ context.Context, rawToken string) (Goo
 type fakeMailer struct {
 	to   string
 	code string
+}
+
+type staticInstallerCatalog struct {
+	installers []release.Installer
+}
+
+func (c staticInstallerCatalog) ListInstallers(context.Context) ([]release.Installer, error) {
+	return c.installers, nil
+}
+
+type failingInstallerCatalog struct{}
+
+func (failingInstallerCatalog) ListInstallers(context.Context) ([]release.Installer, error) {
+	return nil, context.DeadlineExceeded
 }
 
 func (m *fakeMailer) SendEmailCode(_ context.Context, to, code string) error {

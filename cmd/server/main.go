@@ -12,6 +12,7 @@ import (
 
 	"github.com/linlay/zenmind-official-server/internal/auth"
 	"github.com/linlay/zenmind-official-server/internal/config"
+	"github.com/linlay/zenmind-official-server/internal/release"
 )
 
 func main() {
@@ -43,6 +44,15 @@ func run() error {
 		return err
 	}
 
+	installerCatalog, err := release.OpenSQLite(ctx, cfg.InstallerDBPath)
+	if err != nil {
+		return err
+	}
+	defer installerCatalog.Close()
+	if err := installerCatalog.EnsureSchema(ctx); err != nil {
+		return err
+	}
+
 	app := auth.NewServer(store, auth.ServerOptions{
 		CookieName:   cfg.CookieName,
 		CookieSecure: cfg.CookieSecure,
@@ -57,6 +67,7 @@ func run() error {
 		AuthFailureURL:   cfg.AuthFailureURL,
 		MarketServerURL:  cfg.MarketServerURL,
 		MarketProxyToken: cfg.MarketProxyToken,
+		InstallerCatalog: installerCatalog,
 		Mailer: auth.NewSMTPMailer(auth.SMTPMailerConfig{
 			Host:     cfg.SMTPHost,
 			Port:     cfg.SMTPPort,

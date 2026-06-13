@@ -30,6 +30,7 @@ type Config struct {
 	SMTPFrom          string
 	MarketServerURL   string
 	MarketProxyToken  string
+	InstallerDBPath   string
 }
 
 func FromEnv() (Config, error) {
@@ -51,6 +52,7 @@ func FromEnv() (Config, error) {
 		SMTPFrom:          env("SMTP_FROM", "linlay.zenmind@gmail.com"),
 		MarketServerURL:   strings.TrimRight(env("MARKET_SERVER_URL", "http://zenmind-market-server:8088"), "/"),
 		MarketProxyToken:  os.Getenv("MARKET_PROXY_TOKEN"),
+		InstallerDBPath:   env("INSTALLER_DB_PATH", "/data/installers.sqlite"),
 	}
 
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")

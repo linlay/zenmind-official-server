@@ -40,6 +40,7 @@ Required values:
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
+- `INSTALLER_DB_PATH` for the local SQLite installer catalog, defaulting to `/data/installers.sqlite` in the container
 
 Optional values:
 
@@ -71,6 +72,28 @@ docker compose up --build
 ```
 
 The `server` service joins `zenmind-official-net` as `zenmind-official-server`. The host port defaults to `8080` and can be overridden with `SERVER_PORT`.
+The installer catalog is persisted through `./data:/data`; override the container user with `SERVER_USER` if the host deployment user is not `1000:1000`.
+
+## Installer releases
+
+The public installer catalog is served from `GET /api/installers`. Release files should live under `/docker/zenmind-releases/desktop/{version}/{fileName}` on the host, which maps to `/install/releases/desktop/{version}/{fileName}` publicly.
+
+Initialize or repair the current macOS record:
+
+```bash
+go run ./cmd/releasectl upsert \
+  --key mac \
+  --version 0.2.4 \
+  --source /docker/zenmind-releases/v0.2/ZenMind-0.2.4-arm64.dmg \
+  --filename ZenMind-macOS-arm64.dmg
+```
+
+Upload and publish a Windows installer:
+
+```bash
+scp -p ./ZenMind-0.2.4-x64.exe singapore02:/tmp/ZenMind-0.2.4-x64.exe
+ssh singapore02 'cd /docker/zenmind-official-server && go run ./cmd/releasectl upsert --key windows --version 0.2.4 --source /tmp/ZenMind-0.2.4-x64.exe --filename ZenMind-0.2.4-x64.exe'
+```
 
 For a standalone image build:
 

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linlay/zenmind-official-server/internal/release"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -32,6 +33,7 @@ type Server struct {
 	marketServerURL  string
 	marketProxyToken string
 	mailer           Mailer
+	installerCatalog release.Catalog
 	now              func() time.Time
 }
 
@@ -46,6 +48,7 @@ type ServerOptions struct {
 	MarketServerURL  string
 	MarketProxyToken string
 	Mailer           Mailer
+	InstallerCatalog release.Catalog
 }
 
 func NewServer(store Store, opts ServerOptions) *Server {
@@ -82,6 +85,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		marketServerURL:  strings.TrimRight(strings.TrimSpace(opts.MarketServerURL), "/"),
 		marketProxyToken: strings.TrimSpace(opts.MarketProxyToken),
 		mailer:           mailer,
+		installerCatalog: opts.InstallerCatalog,
 		now:              time.Now,
 	}
 }
@@ -89,6 +93,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/installers", s.installers)
 	mux.HandleFunc("GET /api/downloads/stats", s.downloadStats)
 	mux.HandleFunc("POST /api/downloads/events", s.downloadEvent)
 	mux.HandleFunc("POST /api/auth/login", s.login)
@@ -118,6 +123,25 @@ func EnsureInitialAdmin(ctx context.Context, store Store, email, password string
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) installers(w http.ResponseWriter, r *http.Request) {
+	if s.installerCatalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "installers_unavailable", "Installer catalog is unavailable.")
+		return
+	}
+	installers, err := s.installerCatalog.ListInstallers(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "installers_unavailable", "Installer catalog is unavailable.")
+		return
+	}
+	visible := make([]release.Installer, 0, len(installers))
+	for _, installer := range installers {
+		if release.IsAllowedInstallerKey(installer.Key) {
+			visible = append(visible, installer)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"installers": visible})
 }
 
 type loginRequest struct {

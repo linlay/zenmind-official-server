@@ -5,10 +5,13 @@ services:
     image: zenmind-official-server
     container_name: zenmind-official-server
     restart: unless-stopped
+    user: "${SERVER_USER:-1000:1000}"
     env_file:
       - .env
     ports:
       - "${SERVER_PORT:-8080}:8080"
+    volumes:
+      - ./data:/data
     networks:
       zenmind-official-net:
         aliases:

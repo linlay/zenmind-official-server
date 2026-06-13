@@ -12,7 +12,7 @@ FROM alpine:3.22
 
 WORKDIR /app
 COPY --from=build /out/zenmind-server /app/zenmind-server
-RUN addgroup -S zenmind && adduser -S -G zenmind zenmind
+RUN addgroup -S zenmind && adduser -S -G zenmind zenmind && mkdir -p /data && chown -R zenmind:zenmind /data
 USER zenmind
 
 EXPOSE 8080
