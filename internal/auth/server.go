@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -34,6 +36,7 @@ type Server struct {
 	marketProxyToken string
 	mailer           Mailer
 	installerCatalog release.Catalog
+	downloadStore    DownloadStore
 	now              func() time.Time
 }
 
@@ -49,6 +52,7 @@ type ServerOptions struct {
 	MarketProxyToken string
 	Mailer           Mailer
 	InstallerCatalog release.Catalog
+	DownloadStore    DownloadStore
 }
 
 func NewServer(store Store, opts ServerOptions) *Server {
@@ -72,6 +76,14 @@ func NewServer(store Store, opts ServerOptions) *Server {
 	if mailer == nil {
 		mailer = disabledMailer{}
 	}
+	downloadStore := opts.DownloadStore
+	if downloadStore == nil {
+		if candidate, ok := store.(DownloadStore); ok {
+			downloadStore = candidate
+		} else {
+			downloadStore = disabledDownloadStore{}
+		}
+	}
 
 	return &Server{
 		store:            store,
@@ -86,6 +98,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		marketProxyToken: strings.TrimSpace(opts.MarketProxyToken),
 		mailer:           mailer,
 		installerCatalog: opts.InstallerCatalog,
+		downloadStore:    downloadStore,
 		now:              time.Now,
 	}
 }
@@ -302,7 +315,7 @@ func (s *Server) emailCodeVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) downloadStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.ListDownloadStats(r.Context())
+	stats, err := s.downloadStore.ListDownloadStats(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read download stats.")
 		return
@@ -331,16 +344,11 @@ func (s *Server) downloadEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := requestIP(r)
-	userAgent := r.UserAgent()
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		now := s.now().UTC()
-		_ = s.store.RecordDownloadEvent(ctx, installerKey, req.Version, ip, userAgent, now)
-		_ = s.store.IncrementDownloadCount(ctx, installerKey)
-	}()
+	event := downloadEventFromRequest(r, installerKey, req.Version, s.now().UTC())
+	if err := s.downloadStore.RecordDownloadEvent(r.Context(), event); err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to record download event.")
+		return
+	}
 
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
@@ -913,17 +921,65 @@ func (s *Server) recordLogin(r *http.Request, entry LoginLog) {
 }
 
 func requestIP(r *http.Request) string {
-	for _, header := range []string{"X-Forwarded-For", "X-Real-IP"} {
-		value := strings.TrimSpace(r.Header.Get(header))
-		if value == "" {
-			continue
-		}
-		if first, _, ok := strings.Cut(value, ","); ok {
-			return strings.TrimSpace(first)
-		}
-		return value
+	return clientIPFromRequest(r)
+}
+
+func downloadEventFromRequest(r *http.Request, installerKey, version string, downloadedAt time.Time) DownloadEvent {
+	return DownloadEvent{
+		InstallerKey:   installerKey,
+		Version:        version,
+		ClientIP:       clientIPFromRequest(r),
+		RemoteAddr:     strings.TrimSpace(r.RemoteAddr),
+		XForwardedFor:  strings.TrimSpace(r.Header.Get("X-Forwarded-For")),
+		XRealIP:        strings.TrimSpace(r.Header.Get("X-Real-IP")),
+		UserAgent:      r.UserAgent(),
+		Referer:        strings.TrimSpace(r.Referer()),
+		AcceptLanguage: strings.TrimSpace(r.Header.Get("Accept-Language")),
+		DownloadedAt:   downloadedAt,
 	}
-	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func clientIPFromRequest(r *http.Request) string {
+	if ip := firstValidForwardedIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+		return ip
+	}
+	if ip := validHeaderIP(r.Header.Get("X-Real-IP")); ip != "" {
+		return ip
+	}
+	return validRemoteIP(r.RemoteAddr)
+}
+
+func firstValidForwardedIP(value string) string {
+	for _, part := range strings.Split(value, ",") {
+		if ip := validHeaderIP(part); ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+func validHeaderIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return ""
+	}
+	return addr.String()
+}
+
+func validRemoteIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(value)
+	if err == nil {
+		value = host
+	}
+	return validHeaderIP(value)
 }
 
 func randomToken() (string, error) {

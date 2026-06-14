@@ -40,11 +40,12 @@ Required values:
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
-- `INSTALLER_DB_PATH` for the local SQLite installer catalog, defaulting to `/data/installers.sqlite` in the container
+- `SQLITE_DB_PATH` for the local SQLite site data store, defaulting to `/data/data.sqlite` in the container
 
 Optional values:
 
 - `GOOGLE_DESKTOP_CLIENT_ID` when the desktop app uses a separate Google OAuth client id
+- `INSTALLER_DB_PATH` as a legacy fallback for existing deployments that still point to `/data/installers.sqlite`
 
 For Gmail delivery, set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USERNAME=linlay.zenmind@gmail.com`, `SMTP_FROM=linlay.zenmind@gmail.com`, and use a Google App Password as `SMTP_PASSWORD`. Do not use the normal Google account password.
 
@@ -72,11 +73,11 @@ docker compose up --build
 ```
 
 The `server` service joins `zenmind-official-net` as `zenmind-official-server`. The host port defaults to `8080` and can be overridden with `SERVER_PORT`.
-The installer catalog is persisted through `./data:/data`; override the container user with `SERVER_USER` if the host deployment user is not `1000:1000`.
+The SQLite site data store is persisted through `./data:/data`; override the container user with `SERVER_USER` if the host deployment user is not `1000:1000`.
 
 ## Installer releases
 
-The public installer catalog is served from `GET /api/installers`. Release files should live under `/docker/zenmind-releases/desktop/{version}/{fileName}` on the host, which maps to `/install/releases/desktop/{version}/{fileName}` publicly.
+The public installer catalog is served from `GET /api/installers`. Installer records live in the `installer` table inside the site SQLite database, while download event details and aggregate counts live in `download` and `download_stat`. Release files should live under `/docker/zenmind-releases/desktop/{version}/{fileName}` on the host, which maps to `/install/releases/desktop/{version}/{fileName}` publicly.
 
 Initialize or repair the current macOS record:
 

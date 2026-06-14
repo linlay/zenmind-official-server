@@ -289,25 +289,24 @@ func (s *memoryStore) ListDownloadStats(context.Context) ([]DownloadStat, error)
 	return stats, nil
 }
 
-func (s *memoryStore) IncrementDownloadCount(_ context.Context, installerKey string) error {
+func (s *memoryStore) RecordDownloadEvent(_ context.Context, event DownloadEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.stats[installerKey]++
-	return nil
-}
-
-func (s *memoryStore) RecordDownloadEvent(_ context.Context, installerKey, version, ip, userAgent string, downloadedAt time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	event.ID = int64(len(s.events) + 1)
 	s.events = append(s.events, DownloadEvent{
-		ID:           int64(len(s.events) + 1),
-		InstallerKey: installerKey,
-		Version:      version,
-		IP:           ip,
-		UserAgent:    userAgent,
-		DownloadedAt: downloadedAt,
+		ID:             event.ID,
+		InstallerKey:   event.InstallerKey,
+		Version:        event.Version,
+		ClientIP:       event.ClientIP,
+		RemoteAddr:     event.RemoteAddr,
+		XForwardedFor:  event.XForwardedFor,
+		XRealIP:        event.XRealIP,
+		UserAgent:      event.UserAgent,
+		Referer:        event.Referer,
+		AcceptLanguage: event.AcceptLanguage,
+		DownloadedAt:   event.DownloadedAt,
 	})
+	s.stats[event.InstallerKey]++
 	return nil
 }

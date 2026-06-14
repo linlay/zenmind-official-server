@@ -44,12 +44,25 @@ func run() error {
 		return err
 	}
 
-	installerCatalog, err := release.OpenSQLite(ctx, cfg.InstallerDBPath)
+	if cfg.SQLiteDBPathLegacy {
+		log.Printf("Using legacy SQLite database path %s. Set SQLITE_DB_PATH=/data/data.sqlite after migrating the existing database file.", cfg.SQLiteDBPath)
+	}
+
+	installerCatalog, err := release.OpenSQLite(ctx, cfg.SQLiteDBPath)
 	if err != nil {
 		return err
 	}
 	defer installerCatalog.Close()
 	if err := installerCatalog.EnsureSchema(ctx); err != nil {
+		return err
+	}
+
+	downloadStore, err := auth.OpenSQLiteDownloadStore(ctx, cfg.SQLiteDBPath)
+	if err != nil {
+		return err
+	}
+	defer downloadStore.Close()
+	if err := downloadStore.EnsureSchema(ctx); err != nil {
 		return err
 	}
 
@@ -68,6 +81,7 @@ func run() error {
 		MarketServerURL:  cfg.MarketServerURL,
 		MarketProxyToken: cfg.MarketProxyToken,
 		InstallerCatalog: installerCatalog,
+		DownloadStore:    downloadStore,
 		Mailer: auth.NewSMTPMailer(auth.SMTPMailerConfig{
 			Host:     cfg.SMTPHost,
 			Port:     cfg.SMTPPort,

@@ -175,23 +175,18 @@ func TestEmailCodeRejectsInvalidEmail(t *testing.T) {
 func TestDownloadStatsAndEvent(t *testing.T) {
 	handler, store := testHandler(t)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/downloads/events", bytes.NewBufferString(`{"installerKey":"mac","version":"0.2.4"}`))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("event status = %d body = %s", rec.Code, rec.Body.String())
-	}
-
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		store.mu.Lock()
-		total := store.stats["mac"]
-		events := len(store.events)
-		store.mu.Unlock()
-		if total == 1 && events == 1 {
-			break
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/downloads/events", bytes.NewBufferString(`{"installerKey":"mac","version":"0.2.4"}`))
+		req.Header.Set("X-Forwarded-For", "203.0.113.8, 10.0.0.2")
+		req.Header.Set("X-Real-IP", "198.51.100.7")
+		req.Header.Set("User-Agent", "Mozilla/5.0 ZenMind Test")
+		req.Header.Set("Referer", "https://zenmind.cc/download")
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("event status = %d body = %s", rec.Code, rec.Body.String())
 		}
-		time.Sleep(time.Millisecond)
 	}
 
 	statsReq := httptest.NewRequest(http.MethodGet, "/api/downloads/stats", nil)
@@ -206,22 +201,98 @@ func TestDownloadStatsAndEvent(t *testing.T) {
 	if err := json.NewDecoder(statsRec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode stats: %v", err)
 	}
-	if body.Totals["mac"] != 1 || body.Totals["windows"] != 0 {
+	if body.Totals["mac"] != 2 || body.Totals["windows"] != 0 {
 		t.Fatalf("unexpected totals: %#v", body.Totals)
 	}
 
 	store.mu.Lock()
-	if len(store.events) != 1 {
-		t.Fatalf("expected 1 download event, got %d", len(store.events))
+	if len(store.events) != 2 {
+		t.Fatalf("expected 2 download events, got %d", len(store.events))
 	}
 	event := store.events[0]
 	if event.InstallerKey != "mac" || event.Version != "0.2.4" {
 		t.Fatalf("unexpected download event: installerKey=%q version=%q", event.InstallerKey, event.Version)
 	}
-	if event.IP == "" {
-		t.Fatalf("expected IP to be recorded, got empty")
+	if event.ClientIP != "203.0.113.8" {
+		t.Fatalf("expected real client IP to be recorded, got %q", event.ClientIP)
+	}
+	if event.XForwardedFor != "203.0.113.8, 10.0.0.2" || event.XRealIP != "198.51.100.7" {
+		t.Fatalf("unexpected proxy headers: %#v", event)
+	}
+	if event.UserAgent != "Mozilla/5.0 ZenMind Test" || event.Referer != "https://zenmind.cc/download" || event.AcceptLanguage != "zh-CN,zh;q=0.9" {
+		t.Fatalf("unexpected request metadata: %#v", event)
 	}
 	store.mu.Unlock()
+}
+
+func TestRequestIPParsesRealClientIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		xff        string
+		xRealIP    string
+		remoteAddr string
+		want       string
+	}{
+		{
+			name:       "forwarded for leftmost valid IPv4",
+			xff:        "203.0.113.8, 10.0.0.2",
+			xRealIP:    "198.51.100.7",
+			remoteAddr: "192.0.2.1:1234",
+			want:       "203.0.113.8",
+		},
+		{
+			name:       "forwarded for skips invalid and accepts IPv6",
+			xff:        "not-an-ip, 2001:db8::1",
+			remoteAddr: "192.0.2.1:1234",
+			want:       "2001:db8::1",
+		},
+		{
+			name:       "forwarded port value is rejected",
+			xff:        "203.0.113.8:443",
+			xRealIP:    "198.51.100.7",
+			remoteAddr: "192.0.2.1:1234",
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "x real ip fallback",
+			xRealIP:    "2001:db8::2",
+			remoteAddr: "192.0.2.1:1234",
+			want:       "2001:db8::2",
+		},
+		{
+			name:       "remote addr strips IPv4 port",
+			remoteAddr: "192.0.2.44:4567",
+			want:       "192.0.2.44",
+		},
+		{
+			name:       "remote addr strips IPv6 port",
+			remoteAddr: "[2001:db8::3]:4567",
+			want:       "2001:db8::3",
+		},
+		{
+			name:       "invalid values return empty",
+			xff:        "bad",
+			xRealIP:    "198.51.100.7:443",
+			remoteAddr: "also-bad",
+			want:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.xff != "" {
+				req.Header.Set("X-Forwarded-For", tt.xff)
+			}
+			if tt.xRealIP != "" {
+				req.Header.Set("X-Real-IP", tt.xRealIP)
+			}
+			if got := requestIP(req); got != tt.want {
+				t.Fatalf("requestIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestDownloadEventRejectsUnknownInstaller(t *testing.T) {

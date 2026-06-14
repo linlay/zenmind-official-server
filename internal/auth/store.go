@@ -54,12 +54,17 @@ type DownloadStat struct {
 }
 
 type DownloadEvent struct {
-	ID           int64     `json:"id"`
-	InstallerKey string    `json:"installerKey"`
-	Version      string    `json:"version"`
-	IP           string    `json:"ip"`
-	UserAgent    string    `json:"userAgent"`
-	DownloadedAt time.Time `json:"downloadedAt"`
+	ID             int64     `json:"id"`
+	InstallerKey   string    `json:"installerKey"`
+	Version        string    `json:"version"`
+	ClientIP       string    `json:"clientIp"`
+	RemoteAddr     string    `json:"remoteAddr"`
+	XForwardedFor  string    `json:"xForwardedFor"`
+	XRealIP        string    `json:"xRealIp"`
+	UserAgent      string    `json:"userAgent"`
+	Referer        string    `json:"referer"`
+	AcceptLanguage string    `json:"acceptLanguage"`
+	DownloadedAt   time.Time `json:"downloadedAt"`
 }
 
 type Store interface {
@@ -77,9 +82,6 @@ type Store interface {
 	ConsumeDesktopSsoTicket(ctx context.Context, ticketHash string, now time.Time) (User, error)
 	TouchLastLogin(ctx context.Context, userID int64, loggedInAt time.Time) error
 	RecordLogin(ctx context.Context, entry LoginLog) error
-	ListDownloadStats(ctx context.Context) ([]DownloadStat, error)
-	IncrementDownloadCount(ctx context.Context, installerKey string) error
-	RecordDownloadEvent(ctx context.Context, installerKey, version, ip, userAgent string, downloadedAt time.Time) error
 }
 
 type MySQLStore struct {
@@ -186,23 +188,6 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 			PRIMARY KEY (ID_),
 			KEY IDX_AUTH_EMAIL_CODE_EMAIL_CREATED (EMAIL_, CREATED_AT_),
 			KEY IDX_AUTH_EMAIL_CODE_EXPIRES (EXPIRES_AT_)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-		`CREATE TABLE IF NOT EXISTS download_stat (
-			INSTALLER_KEY_ VARCHAR(64) NOT NULL,
-			TOTAL_ BIGINT UNSIGNED NOT NULL DEFAULT 0,
-			CREATED_AT_ DATETIME(3) NOT NULL,
-			UPDATED_AT_ DATETIME(3) NOT NULL,
-			PRIMARY KEY (INSTALLER_KEY_)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-		`CREATE TABLE IF NOT EXISTS download (
-			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-			INSTALLER_KEY_ VARCHAR(64) NOT NULL,
-			VERSION_ VARCHAR(32) NOT NULL DEFAULT '',
-			IP_ VARCHAR(64) NOT NULL DEFAULT '',
-			USER_AGENT_ VARCHAR(512) NOT NULL DEFAULT '',
-			DOWNLOADED_AT_ DATETIME(3) NOT NULL,
-			PRIMARY KEY (ID_),
-			KEY IDX_DOWNLOAD_INSTALLER_AT (INSTALLER_KEY_, DOWNLOADED_AT_)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 	}
 
@@ -544,55 +529,6 @@ func (s *MySQLStore) RecordLogin(ctx context.Context, entry LoginLog) error {
 		truncate(strings.TrimSpace(entry.IP), 64),
 		truncate(strings.TrimSpace(entry.UserAgent), 512),
 		entry.LoginAt,
-	)
-	return err
-}
-
-func (s *MySQLStore) ListDownloadStats(ctx context.Context) ([]DownloadStat, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT INSTALLER_KEY_, TOTAL_ FROM download_stat`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var stats []DownloadStat
-	for rows.Next() {
-		var stat DownloadStat
-		if err := rows.Scan(&stat.InstallerKey, &stat.Total); err != nil {
-			return nil, err
-		}
-		stats = append(stats, stat)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return stats, nil
-}
-
-func (s *MySQLStore) IncrementDownloadCount(ctx context.Context, installerKey string) error {
-	now := time.Now().UTC()
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO download_stat (INSTALLER_KEY_, TOTAL_, CREATED_AT_, UPDATED_AT_)
-		 VALUES (?, 1, ?, ?)
-		 ON DUPLICATE KEY UPDATE TOTAL_ = TOTAL_ + 1, UPDATED_AT_ = VALUES(UPDATED_AT_)`,
-		truncate(strings.TrimSpace(installerKey), 64),
-		now,
-		now,
-	)
-	return err
-}
-
-func (s *MySQLStore) RecordDownloadEvent(ctx context.Context, installerKey, version, ip, userAgent string, downloadedAt time.Time) error {
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO download (INSTALLER_KEY_, VERSION_, IP_, USER_AGENT_, DOWNLOADED_AT_)
-		 VALUES (?, ?, ?, ?, ?)`,
-		truncate(strings.TrimSpace(installerKey), 64),
-		truncate(strings.TrimSpace(version), 32),
-		truncate(strings.TrimSpace(ip), 64),
-		truncate(strings.TrimSpace(userAgent), 512),
-		downloadedAt,
 	)
 	return err
 }

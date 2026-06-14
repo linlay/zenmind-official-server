@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultDBPath      = "/docker/zenmind-official-server/data/installers.sqlite"
+	defaultDBPath      = "/docker/zenmind-official-server/data/data.sqlite"
 	defaultReleaseRoot = "/docker/zenmind-releases"
 )
 
@@ -41,7 +41,7 @@ func runUpsert(args []string) error {
 	flags.SetOutput(os.Stderr)
 
 	var opts release.UpsertFileOptions
-	flags.StringVar(&opts.DBPath, "db", env("INSTALLER_DB_PATH", defaultDBPath), "SQLite database path")
+	flags.StringVar(&opts.DBPath, "db", env("SQLITE_DB_PATH", env("INSTALLER_DB_PATH", defaultDBPath)), "SQLite database path")
 	flags.StringVar(&opts.ReleaseRoot, "release-root", env("RELEASE_ROOT", defaultReleaseRoot), "release file root")
 	flags.StringVar(&opts.Key, "key", "", "installer key: mac or windows")
 	flags.StringVar(&opts.Version, "version", "", "installer version")
