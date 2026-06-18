@@ -450,6 +450,158 @@ func TestGoogleCallbackCreatesSession(t *testing.T) {
 	}
 }
 
+func TestAuthentikSSOSessionRejectsMissingIdentity(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/sso/session?rd=/profile", nil)
+	req.Header.Set("X-ZenMind-SSO-Bridge-Token", "test-sso-bridge-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Location") != "http://localhost:5173/login?error=sso_missing_identity" {
+		t.Fatalf("unexpected failure redirect %q", rec.Header().Get("Location"))
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("missing identity set cookies: %#v", rec.Result().Cookies())
+	}
+}
+
+func TestAuthentikSSOSessionRejectsUntrustedBridge(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/sso/session?rd=/profile", nil)
+	req.Header.Set("X-Authentik-Uid", "spoofed-subject")
+	req.Header.Set("X-Authentik-Email", "spoofed@example.com")
+	req.Header.Set("X-Authentik-Name", "Spoofed User")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Location") != "http://localhost:5173/login?error=sso_untrusted_bridge" {
+		t.Fatalf("unexpected failure redirect %q", rec.Header().Get("Location"))
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("untrusted bridge set cookies: %#v", rec.Result().Cookies())
+	}
+}
+
+func TestAuthentikSSOSessionCreatesSession(t *testing.T) {
+	handler, store := testHandler(t)
+
+	req := authentikSSORequest("/api/auth/sso/session?rd=/profile", "authentik-user-id", "Sso.User@Example.com", "SSO User")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Location") != "/profile" {
+		t.Fatalf("unexpected success redirect %q", rec.Header().Get("Location"))
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "test_session" || !cookies[0].HttpOnly {
+		t.Fatalf("unexpected SSO cookies: %#v", cookies)
+	}
+	if len(store.authentik) != 1 {
+		t.Fatalf("expected one authentik user, got %#v", store.authentik)
+	}
+
+	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	meReq.AddCookie(cookies[0])
+	meRec := httptest.NewRecorder()
+	handler.ServeHTTP(meRec, meReq)
+	if meRec.Code != http.StatusOK {
+		t.Fatalf("me status = %d body = %s", meRec.Code, meRec.Body.String())
+	}
+	var me map[string]map[string]any
+	if err := json.NewDecoder(meRec.Body).Decode(&me); err != nil {
+		t.Fatalf("decode me: %v", err)
+	}
+	if me["user"]["email"] != "sso.user@example.com" || me["user"]["authProvider"] != "authentik" {
+		t.Fatalf("unexpected me response: %#v", me)
+	}
+}
+
+func TestAuthentikSSOSessionUpdatesExistingUser(t *testing.T) {
+	handler, store := testHandler(t)
+
+	firstReq := authentikSSORequest("/api/auth/sso/session", "same-subject", "first@example.com", "First Name")
+	firstRec := httptest.NewRecorder()
+	handler.ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusFound {
+		t.Fatalf("first status = %d body = %s", firstRec.Code, firstRec.Body.String())
+	}
+
+	secondReq := authentikSSORequest("/api/auth/sso/session", "same-subject", "second@example.com", "Second Name")
+	secondReq.Header.Set("X-Authentik-Picture", "https://example.com/avatar.png")
+	secondRec := httptest.NewRecorder()
+	handler.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusFound {
+		t.Fatalf("second status = %d body = %s", secondRec.Code, secondRec.Body.String())
+	}
+	if len(store.authentik) != 1 {
+		t.Fatalf("expected one authentik user, got %#v", store.authentik)
+	}
+	userID := store.authentik["same-subject"]
+	user := store.users[userID]
+	if user.Email != "second@example.com" || user.DisplayName != "Second Name" || user.AvatarURL != "https://example.com/avatar.png" {
+		t.Fatalf("user was not updated: %#v", user)
+	}
+}
+
+func TestAuthentikSSOSessionRejectsDisabledUser(t *testing.T) {
+	handler, store := testHandler(t)
+	if _, err := store.UpsertAuthentikUser(context.Background(), AuthentikIdentity{
+		Subject: "disabled-subject",
+		Email:   "disabled@example.com",
+		Name:    "Disabled User",
+	}, ""); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	store.mu.Lock()
+	userID := store.authentik["disabled-subject"]
+	user := store.users[userID]
+	user.Enabled = false
+	store.users[userID] = user
+	store.mu.Unlock()
+
+	req := authentikSSORequest("/api/auth/sso/session?rd=/profile", "disabled-subject", "disabled@example.com", "Disabled User")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Location") != "http://localhost:5173/login?error=account_disabled" {
+		t.Fatalf("unexpected disabled redirect %q", rec.Header().Get("Location"))
+	}
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == "test_session" && cookie.Value != "" {
+			t.Fatalf("disabled user received session cookie: %#v", rec.Result().Cookies())
+		}
+	}
+}
+
+func TestAuthentikSSOSessionRejectsExternalRedirect(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := authentikSSORequest("/api/auth/sso/session?rd="+url.QueryEscape("https://evil.example/profile"), "safe-subject", "safe@example.com", "Safe User")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Location") != "/" {
+		t.Fatalf("external redirect was not sanitized: %q", rec.Header().Get("Location"))
+	}
+}
+
 func TestGoogleDesktopStartRejectsNonLoopbackCallback(t *testing.T) {
 	handler, _ := testHandler(t)
 
@@ -702,6 +854,7 @@ func testHandler(t *testing.T) (http.Handler, *memoryStore) {
 		Google:         fakeGoogleProvider{},
 		AuthSuccessURL: "http://localhost:5173/login",
 		AuthFailureURL: "http://localhost:5173/login",
+		SSOBridgeToken: "test-sso-bridge-token",
 	})
 	return server.Routes(), store
 }
@@ -720,6 +873,7 @@ func testHandlerWithMailer(t *testing.T) (http.Handler, *memoryStore, *fakeMaile
 		Google:         fakeGoogleProvider{},
 		AuthSuccessURL: "http://localhost:5173/login",
 		AuthFailureURL: "http://localhost:5173/login",
+		SSOBridgeToken: "test-sso-bridge-token",
 		Mailer:         mailer,
 	})
 	return server.Routes(), store, mailer
@@ -731,6 +885,16 @@ func cookiesByName(cookies []*http.Cookie) map[string]*http.Cookie {
 		result[cookie.Name] = cookie
 	}
 	return result
+}
+
+func authentikSSORequest(target, subject, email, name string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("X-ZenMind-SSO-Bridge-Token", "test-sso-bridge-token")
+	req.Header.Set("X-Authentik-Uid", subject)
+	req.Header.Set("X-Authentik-Email", email)
+	req.Header.Set("X-Authentik-Name", name)
+	req.Header.Set("X-Authentik-Username", email)
+	return req
 }
 
 func startDesktopGoogleLogin(t *testing.T, handler http.Handler, callbackURL, desktopState string) *httptest.ResponseRecorder {

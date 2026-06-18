@@ -2,23 +2,25 @@ package auth
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 )
 
 type memoryStore struct {
-	mu       sync.Mutex
-	nextID   int64
-	users    map[int64]User
-	local    map[string]int64
-	google   map[string]int64
-	email    map[string]int64
-	tickets  map[string]desktopSsoTicketRecord
-	sessions map[string]sessionRecord
-	logins   []LoginLog
-	codes    []emailCodeRecord
-	stats    map[string]int64
-	events   []DownloadEvent
+	mu        sync.Mutex
+	nextID    int64
+	users     map[int64]User
+	local     map[string]int64
+	google    map[string]int64
+	authentik map[string]int64
+	email     map[string]int64
+	tickets   map[string]desktopSsoTicketRecord
+	sessions  map[string]sessionRecord
+	logins    []LoginLog
+	codes     []emailCodeRecord
+	stats     map[string]int64
+	events    []DownloadEvent
 }
 
 type sessionRecord struct {
@@ -42,14 +44,15 @@ type emailCodeRecord struct {
 
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
-		nextID:   1,
-		users:    map[int64]User{},
-		local:    map[string]int64{},
-		google:   map[string]int64{},
-		email:    map[string]int64{},
-		tickets:  map[string]desktopSsoTicketRecord{},
-		sessions: map[string]sessionRecord{},
-		stats:    map[string]int64{},
+		nextID:    1,
+		users:     map[int64]User{},
+		local:     map[string]int64{},
+		google:    map[string]int64{},
+		authentik: map[string]int64{},
+		email:     map[string]int64{},
+		tickets:   map[string]desktopSsoTicketRecord{},
+		sessions:  map[string]sessionRecord{},
+		stats:     map[string]int64{},
 	}
 }
 
@@ -137,6 +140,47 @@ func (s *memoryStore) UpsertGoogleUser(_ context.Context, identity GoogleIdentit
 	user.DisplayName = displayName
 	user.AvatarURL = identity.Picture
 	user.AuthProvider = "google"
+	user.AuthSub = subject
+	if !exists || user.Role == "" {
+		user.Role = "user"
+	}
+	if !exists {
+		user.Enabled = true
+	}
+	s.users[userID] = user
+	return user, nil
+}
+
+func (s *memoryStore) UpsertAuthentikUser(_ context.Context, identity AuthentikIdentity, _ string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	subject := strings.TrimSpace(identity.Subject)
+	email := normalizeEmail(identity.Email)
+	if subject == "" || !validEmail(email) {
+		return User{}, ErrNotFound
+	}
+
+	userID, exists := s.authentik[subject]
+	if !exists {
+		userID = s.nextID
+		s.nextID++
+		s.authentik[subject] = userID
+	}
+
+	displayName := strings.TrimSpace(identity.Name)
+	if displayName == "" {
+		displayName = strings.TrimSpace(identity.Username)
+	}
+	if displayName == "" {
+		displayName = email
+	}
+	user := s.users[userID]
+	user.ID = userID
+	user.Email = email
+	user.DisplayName = displayName
+	user.AvatarURL = strings.TrimSpace(identity.Picture)
+	user.AuthProvider = "authentik"
 	user.AuthSub = subject
 	if !exists || user.Role == "" {
 		user.Role = "user"

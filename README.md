@@ -8,6 +8,7 @@ Go 1.26 backend for the ZenMind official site login flow.
 - Initial administrator bootstrap from environment variables
 - bcrypt password verification
 - HttpOnly SameSite=Lax cookie sessions
+- authentik forward-auth session bridge
 
 ## API
 
@@ -19,6 +20,7 @@ Go 1.26 backend for the ZenMind official site login flow.
 - `GET /api/auth/google/callback`
 - `GET /api/auth/google/desktop/start`
 - `POST /api/auth/desktop-sso/session`
+- `GET /api/auth/sso/session`
 - `GET /api/auth/me`
 - `POST /api/auth/logout`
 - `GET /api/downloads/stats`
@@ -38,6 +40,7 @@ Required values:
 - `INIT_ADMIN_EMAIL`, `INIT_ADMIN_PASSWORD`
 - `COOKIE_NAME`, `COOKIE_SECURE`, `SESSION_TTL`
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`
+- `SSO_BRIDGE_TOKEN` matching the website nginx bridge token for authentik forward-auth sessions
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
 - `SQLITE_DB_PATH` for the local SQLite site data store, defaulting to `/data/data.sqlite` in the container

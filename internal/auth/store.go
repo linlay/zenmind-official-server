@@ -29,6 +29,14 @@ type User struct {
 	PasswordHash string     `json:"-"`
 }
 
+type AuthentikIdentity struct {
+	Subject  string
+	Email    string
+	Name     string
+	Username string
+	Picture  string
+}
+
 type LoginLog struct {
 	UserID        *int64
 	Email         string
@@ -73,6 +81,7 @@ type Store interface {
 	FindLocalUserByEmail(ctx context.Context, email string) (User, error)
 	FindUserBySession(ctx context.Context, tokenHash string, now time.Time) (User, error)
 	UpsertGoogleUser(ctx context.Context, identity GoogleIdentity, ip string) (User, error)
+	UpsertAuthentikUser(ctx context.Context, identity AuthentikIdentity, ip string) (User, error)
 	UpsertEmailCodeUser(ctx context.Context, email, ip string) (User, error)
 	SaveEmailCode(ctx context.Context, email, codeHash string, expiresAt time.Time) error
 	ConsumeEmailCode(ctx context.Context, email, codeHash string, now time.Time) error
@@ -323,6 +332,59 @@ func (s *MySQLStore) UpsertGoogleUser(ctx context.Context, identity GoogleIdenti
 		 FROM auth_user u
 		 WHERE u.AUTH_PROVIDER_ = 'google' AND u.AUTH_SUB_ = ?`,
 		strings.TrimSpace(identity.Subject),
+	)
+	user, err := scanUserWithPassword(row)
+	if err != nil {
+		return User{}, err
+	}
+	_ = ip
+	return user, nil
+}
+
+func (s *MySQLStore) UpsertAuthentikUser(ctx context.Context, identity AuthentikIdentity, ip string) (User, error) {
+	now := time.Now().UTC()
+	subject := strings.TrimSpace(identity.Subject)
+	email := normalizeEmail(identity.Email)
+	if subject == "" || !validEmail(email) {
+		return User{}, ErrNotFound
+	}
+	displayName := strings.TrimSpace(identity.Name)
+	if displayName == "" {
+		displayName = strings.TrimSpace(identity.Username)
+	}
+	if displayName == "" {
+		displayName = email
+	}
+
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO auth_user (EMAIL_, DISPLAY_NAME_, AVATAR_URL_, AUTH_PROVIDER_, AUTH_SUB_, ROLE_, ENABLED_, CREATED_AT_, UPDATED_AT_, LAST_LOGIN_AT_)
+		 VALUES (?, ?, ?, 'authentik', ?, 'user', 1, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		   EMAIL_ = VALUES(EMAIL_),
+		   DISPLAY_NAME_ = VALUES(DISPLAY_NAME_),
+		   AVATAR_URL_ = VALUES(AVATAR_URL_),
+		   UPDATED_AT_ = VALUES(UPDATED_AT_),
+		   LAST_LOGIN_AT_ = VALUES(LAST_LOGIN_AT_)`,
+		email,
+		displayName,
+		strings.TrimSpace(identity.Picture),
+		subject,
+		now,
+		now,
+		now,
+	)
+	if err != nil {
+		return User{}, err
+	}
+
+	row := s.db.QueryRowContext(
+		ctx,
+		userSelectList+`
+		 , '' AS PASSWORD_HASH_
+		 FROM auth_user u
+		 WHERE u.AUTH_PROVIDER_ = 'authentik' AND u.AUTH_SUB_ = ?`,
+		subject,
 	)
 	user, err := scanUserWithPassword(row)
 	if err != nil {

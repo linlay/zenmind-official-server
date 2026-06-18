@@ -78,6 +78,7 @@ func run() error {
 		}),
 		AuthSuccessURL:   cfg.AuthSuccessURL,
 		AuthFailureURL:   cfg.AuthFailureURL,
+		SSOBridgeToken:   cfg.SSOBridgeToken,
 		MarketServerURL:  cfg.MarketServerURL,
 		MarketProxyToken: cfg.MarketProxyToken,
 		InstallerCatalog: installerCatalog,

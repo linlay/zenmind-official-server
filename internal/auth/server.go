@@ -31,6 +31,7 @@ type Server struct {
 	google           GoogleProvider
 	authSuccessURL   string
 	authFailureURL   string
+	ssoBridgeToken   string
 	desktopTicketTTL time.Duration
 	marketServerURL  string
 	marketProxyToken string
@@ -47,6 +48,7 @@ type ServerOptions struct {
 	Google           GoogleProvider
 	AuthSuccessURL   string
 	AuthFailureURL   string
+	SSOBridgeToken   string
 	DesktopTicketTTL time.Duration
 	MarketServerURL  string
 	MarketProxyToken string
@@ -93,6 +95,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		google:           google,
 		authSuccessURL:   strings.TrimSpace(opts.AuthSuccessURL),
 		authFailureURL:   strings.TrimSpace(opts.AuthFailureURL),
+		ssoBridgeToken:   strings.TrimSpace(opts.SSOBridgeToken),
 		desktopTicketTTL: desktopTicketTTL,
 		marketServerURL:  strings.TrimRight(strings.TrimSpace(opts.MarketServerURL), "/"),
 		marketProxyToken: strings.TrimSpace(opts.MarketProxyToken),
@@ -117,6 +120,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/auth/google/callback", s.googleCallback)
 	mux.HandleFunc("GET /api/auth/google/desktop/start", s.googleDesktopStart)
 	mux.HandleFunc("POST /api/auth/desktop-sso/session", s.desktopSsoSession)
+	mux.HandleFunc("GET /api/auth/sso/session", s.authentikSsoSession)
 	mux.HandleFunc("GET /api/auth/me", s.me)
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
 	mux.HandleFunc("/api/market/admin/", s.marketAdminProxy)
@@ -619,6 +623,47 @@ func (s *Server) desktopSsoTicketSession(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": publicUser(user)})
 }
 
+func (s *Server) authentikSsoSession(w http.ResponseWriter, r *http.Request) {
+	if s.ssoBridgeToken == "" || strings.TrimSpace(r.Header.Get("X-ZenMind-SSO-Bridge-Token")) != s.ssoBridgeToken {
+		s.recordLogin(r, LoginLog{AuthMethod: "authentik", LoginResult: "failure", FailureReason: "untrusted_bridge"})
+		s.redirectFailure(w, r, "sso_untrusted_bridge")
+		return
+	}
+
+	identity := authentikIdentityFromRequest(r)
+	if strings.TrimSpace(identity.Subject) == "" || !validEmail(identity.Email) {
+		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "authentik", LoginResult: "failure", FailureReason: "missing_identity"})
+		s.redirectFailure(w, r, "sso_missing_identity")
+		return
+	}
+
+	user, err := s.store.UpsertAuthentikUser(r.Context(), identity, requestIP(r))
+	if err != nil {
+		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "authentik", LoginResult: "failure", FailureReason: "user_upsert_failed"})
+		s.redirectFailure(w, r, "sso_user_failed")
+		return
+	}
+	if !user.Enabled {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "authentik", LoginResult: "failure", FailureReason: "account_disabled"})
+		s.redirectFailure(w, r, "account_disabled")
+		return
+	}
+
+	token, expiresAt, err := s.createSession(r, user.ID)
+	if err != nil {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "authentik", LoginResult: "failure", FailureReason: "session_create_failed"})
+		s.redirectFailure(w, r, "sso_session_failed")
+		return
+	}
+
+	now := s.now().UTC()
+	_ = s.store.TouchLastLogin(r.Context(), user.ID, now)
+	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "authentik", LoginResult: "success"})
+
+	http.SetCookie(w, s.sessionCookie(token, expiresAt))
+	http.Redirect(w, r, safeRelativeRedirect(r.URL.Query().Get("rd")), http.StatusFound)
+}
+
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	user, err := s.currentUser(r)
 	if errors.Is(err, ErrNotFound) {
@@ -651,6 +696,42 @@ func (s *Server) currentUser(r *http.Request) (User, error) {
 		return User{}, ErrNotFound
 	}
 	return s.store.FindUserBySession(r.Context(), tokenHash(cookie.Value), s.now().UTC())
+}
+
+func authentikIdentityFromRequest(r *http.Request) AuthentikIdentity {
+	username := headerFirst(r, "X-Authentik-Username")
+	email := normalizeEmail(headerFirst(r, "X-Authentik-Email"))
+	if email == "" && validEmail(username) {
+		email = normalizeEmail(username)
+	}
+	return AuthentikIdentity{
+		Subject:  headerFirst(r, "X-Authentik-Uid", "X-Authentik-Subject", "X-Authentik-User-Id"),
+		Email:    email,
+		Name:     headerFirst(r, "X-Authentik-Name"),
+		Username: username,
+		Picture:  headerFirst(r, "X-Authentik-Picture", "X-Authentik-Avatar"),
+	}
+}
+
+func headerFirst(r *http.Request, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func safeRelativeRedirect(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "//") || strings.ContainsAny(value, "\r\n\\") {
+		return "/"
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/") {
+		return "/"
+	}
+	return parsed.String()
 }
 
 func (s *Server) marketAdminProxy(w http.ResponseWriter, r *http.Request) {

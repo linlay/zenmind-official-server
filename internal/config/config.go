@@ -29,6 +29,7 @@ type Config struct {
 	GoogleDesktopID    string
 	GoogleSecret       string
 	GoogleRedirectURL  string
+	SSOBridgeToken     string
 	AuthSuccessURL     string
 	AuthFailureURL     string
 	SMTPHost           string
@@ -53,6 +54,7 @@ func FromEnv() (Config, error) {
 		GoogleDesktopID:    os.Getenv("GOOGLE_DESKTOP_CLIENT_ID"),
 		GoogleSecret:       os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleRedirectURL:  os.Getenv("GOOGLE_REDIRECT_URL"),
+		SSOBridgeToken:     os.Getenv("SSO_BRIDGE_TOKEN"),
 		AuthSuccessURL:     env("AUTH_SUCCESS_URL", "http://localhost:5173/login"),
 		AuthFailureURL:     env("AUTH_FAILURE_URL", "http://localhost:5173/login"),
 		SMTPHost:           env("SMTP_HOST", "smtp.gmail.com"),
