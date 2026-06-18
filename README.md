@@ -19,6 +19,7 @@ Go 1.26 backend for the ZenMind official site login flow.
 - `GET /api/auth/google/start`
 - `GET /api/auth/google/callback`
 - `GET /api/auth/google/desktop/start`
+- `GET /api/auth/desktop-sso/start`
 - `POST /api/auth/desktop-sso/session`
 - `GET /api/auth/sso/session`
 - `GET /api/auth/me`
@@ -41,6 +42,8 @@ Required values:
 - `COOKIE_NAME`, `COOKIE_SECURE`, `SESSION_TTL`
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`
 - `SSO_BRIDGE_TOKEN` matching the website nginx bridge token for authentik forward-auth sessions
+- `DESKTOP_SSO_PROVIDER`, defaulting to `authentik`
+- `DESKTOP_SSO_TICKET_TTL`, defaulting to `2m`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
 - `SQLITE_DB_PATH` for the local SQLite site data store, defaulting to `/data/data.sqlite` in the container

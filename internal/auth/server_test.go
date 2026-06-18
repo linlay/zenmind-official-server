@@ -602,6 +602,84 @@ func TestAuthentikSSOSessionRejectsExternalRedirect(t *testing.T) {
 	}
 }
 
+func TestDesktopSSOStartRejectsUntrustedBridge(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/desktop-sso/start?callback="+url.QueryEscape("http://localhost:43123/api/auth/oidc/callback")+"&state=desktop-state", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDesktopSSOStartCreatesTicketAndBearerSession(t *testing.T) {
+	handler, _ := testHandler(t)
+	callbackURL := "http://localhost:43123/api/auth/oidc/callback"
+
+	startReq := authentikSSORequest(
+		"/api/auth/desktop-sso/start?callback="+url.QueryEscape(callbackURL)+"&state=desktop-state",
+		"desktop-authentik-subject",
+		"desktop.user@example.com",
+		"Desktop User",
+	)
+	startRec := httptest.NewRecorder()
+	handler.ServeHTTP(startRec, startReq)
+
+	if startRec.Code != http.StatusFound {
+		t.Fatalf("start status = %d body = %s", startRec.Code, startRec.Body.String())
+	}
+	location, err := url.Parse(startRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse desktop redirect: %v", err)
+	}
+	if location.Scheme != "http" || location.Host != "localhost:43123" || location.Path != "/api/auth/oidc/callback" {
+		t.Fatalf("unexpected desktop redirect %q", startRec.Header().Get("Location"))
+	}
+	if location.Query().Get("state") != "desktop-state" {
+		t.Fatalf("unexpected desktop state %q", location.Query().Get("state"))
+	}
+	ticket := location.Query().Get("ticket")
+	if ticket == "" {
+		t.Fatalf("missing desktop ticket in %q", startRec.Header().Get("Location"))
+	}
+
+	exchangeReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"ticket":"`+ticket+`"}`))
+	exchangeRec := httptest.NewRecorder()
+	handler.ServeHTTP(exchangeRec, exchangeReq)
+	if exchangeRec.Code != http.StatusOK {
+		t.Fatalf("exchange status = %d body = %s", exchangeRec.Code, exchangeRec.Body.String())
+	}
+	var exchangeBody map[string]any
+	if err := json.NewDecoder(exchangeRec.Body).Decode(&exchangeBody); err != nil {
+		t.Fatalf("decode exchange: %v", err)
+	}
+	accessToken, _ := exchangeBody["accessToken"].(string)
+	if accessToken == "" || exchangeBody["tokenType"] != "Bearer" {
+		t.Fatalf("unexpected token exchange body: %#v", exchangeBody)
+	}
+	cookies := exchangeRec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "test_session" || !cookies[0].HttpOnly {
+		t.Fatalf("unexpected desktop SSO cookies: %#v", cookies)
+	}
+
+	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	meReq.Header.Set("Authorization", "Bearer "+accessToken)
+	meRec := httptest.NewRecorder()
+	handler.ServeHTTP(meRec, meReq)
+	if meRec.Code != http.StatusOK {
+		t.Fatalf("bearer me status = %d body = %s", meRec.Code, meRec.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"ticket":"`+ticket+`"}`))
+	secondRec := httptest.NewRecorder()
+	handler.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusUnauthorized {
+		t.Fatalf("second exchange status = %d body = %s", secondRec.Code, secondRec.Body.String())
+	}
+}
+
 func TestGoogleDesktopStartRejectsNonLoopbackCallback(t *testing.T) {
 	handler, _ := testHandler(t)
 

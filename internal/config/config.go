@@ -18,54 +18,58 @@ const (
 )
 
 type Config struct {
-	Addr               string
-	DatabaseURL        string
-	InitAdminEmail     string
-	InitAdminPassword  string
-	CookieName         string
-	CookieSecure       bool
-	SessionTTL         time.Duration
-	GoogleClientID     string
-	GoogleDesktopID    string
-	GoogleSecret       string
-	GoogleRedirectURL  string
-	SSOBridgeToken     string
-	AuthSuccessURL     string
-	AuthFailureURL     string
-	SMTPHost           string
-	SMTPPort           string
-	SMTPUsername       string
-	SMTPPassword       string
-	SMTPFrom           string
-	MarketServerURL    string
-	MarketProxyToken   string
-	SQLiteDBPath       string
-	SQLiteDBPathLegacy bool
+	Addr                string
+	DatabaseURL         string
+	InitAdminEmail      string
+	InitAdminPassword   string
+	CookieName          string
+	CookieSecure        bool
+	SessionTTL          time.Duration
+	GoogleClientID      string
+	GoogleDesktopID     string
+	GoogleSecret        string
+	GoogleRedirectURL   string
+	SSOBridgeToken      string
+	DesktopSSOProvider  string
+	DesktopSSOTicketTTL time.Duration
+	AuthSuccessURL      string
+	AuthFailureURL      string
+	SMTPHost            string
+	SMTPPort            string
+	SMTPUsername        string
+	SMTPPassword        string
+	SMTPFrom            string
+	MarketServerURL     string
+	MarketProxyToken    string
+	SQLiteDBPath        string
+	SQLiteDBPathLegacy  bool
 }
 
 func FromEnv() (Config, error) {
 	sqliteDBPath, sqliteDBPathLegacy := resolveSQLiteDBPath()
 	cfg := Config{
-		Addr:               env("APP_ADDR", ":8080"),
-		CookieName:         env("COOKIE_NAME", "zenmind_session"),
-		CookieSecure:       envBool("COOKIE_SECURE", false),
-		SessionTTL:         envDuration("SESSION_TTL", 24*time.Hour),
-		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
-		GoogleDesktopID:    os.Getenv("GOOGLE_DESKTOP_CLIENT_ID"),
-		GoogleSecret:       os.Getenv("GOOGLE_CLIENT_SECRET"),
-		GoogleRedirectURL:  os.Getenv("GOOGLE_REDIRECT_URL"),
-		SSOBridgeToken:     os.Getenv("SSO_BRIDGE_TOKEN"),
-		AuthSuccessURL:     env("AUTH_SUCCESS_URL", "http://localhost:5173/login"),
-		AuthFailureURL:     env("AUTH_FAILURE_URL", "http://localhost:5173/login"),
-		SMTPHost:           env("SMTP_HOST", "smtp.gmail.com"),
-		SMTPPort:           env("SMTP_PORT", "587"),
-		SMTPUsername:       env("SMTP_USERNAME", "linlay.zenmind@gmail.com"),
-		SMTPPassword:       os.Getenv("SMTP_PASSWORD"),
-		SMTPFrom:           env("SMTP_FROM", "linlay.zenmind@gmail.com"),
-		MarketServerURL:    strings.TrimRight(env("MARKET_SERVER_URL", "http://zenmind-market-server:8088"), "/"),
-		MarketProxyToken:   os.Getenv("MARKET_PROXY_TOKEN"),
-		SQLiteDBPath:       sqliteDBPath,
-		SQLiteDBPathLegacy: sqliteDBPathLegacy,
+		Addr:                env("APP_ADDR", ":8080"),
+		CookieName:          env("COOKIE_NAME", "zenmind_session"),
+		CookieSecure:        envBool("COOKIE_SECURE", false),
+		SessionTTL:          envDuration("SESSION_TTL", 24*time.Hour),
+		GoogleClientID:      os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleDesktopID:     os.Getenv("GOOGLE_DESKTOP_CLIENT_ID"),
+		GoogleSecret:        os.Getenv("GOOGLE_CLIENT_SECRET"),
+		GoogleRedirectURL:   os.Getenv("GOOGLE_REDIRECT_URL"),
+		SSOBridgeToken:      os.Getenv("SSO_BRIDGE_TOKEN"),
+		DesktopSSOProvider:  env("DESKTOP_SSO_PROVIDER", "authentik"),
+		DesktopSSOTicketTTL: envDuration("DESKTOP_SSO_TICKET_TTL", 2*time.Minute),
+		AuthSuccessURL:      env("AUTH_SUCCESS_URL", "http://localhost:5173/login"),
+		AuthFailureURL:      env("AUTH_FAILURE_URL", "http://localhost:5173/login"),
+		SMTPHost:            env("SMTP_HOST", "smtp.gmail.com"),
+		SMTPPort:            env("SMTP_PORT", "587"),
+		SMTPUsername:        env("SMTP_USERNAME", "linlay.zenmind@gmail.com"),
+		SMTPPassword:        os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:            env("SMTP_FROM", "linlay.zenmind@gmail.com"),
+		MarketServerURL:     strings.TrimRight(env("MARKET_SERVER_URL", "http://zenmind-market-server:8088"), "/"),
+		MarketProxyToken:    os.Getenv("MARKET_PROXY_TOKEN"),
+		SQLiteDBPath:        sqliteDBPath,
+		SQLiteDBPathLegacy:  sqliteDBPathLegacy,
 	}
 
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
