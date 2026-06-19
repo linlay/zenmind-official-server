@@ -44,6 +44,8 @@ Required values:
 - `SSO_BRIDGE_TOKEN` matching the website nginx bridge token for authentik forward-auth sessions
 - `DESKTOP_SSO_PROVIDER`, defaulting to `authentik`
 - `DESKTOP_SSO_TICKET_TTL`, defaulting to `2m`
+- `SSO_JWT_PRIVATE_KEY_FILE` or `SSO_JWT_PRIVATE_KEY_PEM`, plus explicit `SSO_JWT_ISSUER`, for Desktop bridge JWT signing
+- `SSO_JWT_AUDIENCES`, defaulting to `zenmind-market-server,zenmind-tunnel-hub-server`; `SSO_JWT_TTL`, defaulting to `24h`; `SSO_JWT_KEY_ID`, defaulting to `default`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
 - `SQLITE_DB_PATH` for the local SQLite site data store, defaulting to `/data/data.sqlite` in the container

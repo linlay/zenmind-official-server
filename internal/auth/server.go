@@ -34,6 +34,7 @@ type Server struct {
 	ssoBridgeToken     string
 	desktopSSOProvider string
 	desktopTicketTTL   time.Duration
+	desktopJWTSigner   *desktopJWTSigner
 	marketServerURL    string
 	marketProxyToken   string
 	mailer             Mailer
@@ -52,6 +53,7 @@ type ServerOptions struct {
 	SSOBridgeToken     string
 	DesktopSSOProvider string
 	DesktopTicketTTL   time.Duration
+	DesktopJWT         DesktopJWTConfig
 	MarketServerURL    string
 	MarketProxyToken   string
 	Mailer             Mailer
@@ -100,6 +102,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		ssoBridgeToken:     strings.TrimSpace(opts.SSOBridgeToken),
 		desktopSSOProvider: normalizeDesktopSSOProvider(opts.DesktopSSOProvider),
 		desktopTicketTTL:   desktopTicketTTL,
+		desktopJWTSigner:   newDesktopJWTSigner(opts.DesktopJWT),
 		marketServerURL:    strings.TrimRight(strings.TrimSpace(opts.MarketServerURL), "/"),
 		marketProxyToken:   strings.TrimSpace(opts.MarketProxyToken),
 		mailer:             mailer,
@@ -627,30 +630,16 @@ func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, expiresAt, err := s.createSession(r, user.ID)
-	if err != nil {
-		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "session_create_failed"})
-		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
-		return
-	}
-
-	now := s.now().UTC()
-	_ = s.store.TouchLastLogin(r.Context(), user.ID, now)
-	user.LastLoginAt = &now
-	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "success"})
-
-	http.SetCookie(w, s.sessionCookie(token, expiresAt))
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"user":        publicUser(user),
-		"accessToken": token,
-		"tokenType":   "Bearer",
-		"expiresAt":   expiresAt,
-	})
+	s.writeDesktopSsoSessionResponse(w, r, user, "desktop_google")
 }
 
 func (s *Server) desktopSsoTicketSession(w http.ResponseWriter, r *http.Request, ticket string) {
 	authMethod := s.desktopSSOAuthMethod()
+	if !s.desktopJWTSigner.configured() {
+		s.recordLogin(r, LoginLog{AuthMethod: authMethod, LoginResult: "failure", FailureReason: "jwt_signer_not_configured"})
+		writeError(w, http.StatusServiceUnavailable, "sso_jwt_not_configured", "Desktop SSO JWT signer is not configured.")
+		return
+	}
 	user, err := s.store.ConsumeDesktopSsoTicket(r.Context(), tokenHash(ticket), s.now().UTC())
 	if errors.Is(err, ErrNotFound) {
 		s.recordLogin(r, LoginLog{AuthMethod: authMethod, LoginResult: "failure", FailureReason: "invalid_ticket"})
@@ -667,7 +656,18 @@ func (s *Server) desktopSsoTicketSession(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	token, expiresAt, err := s.createSession(r, user.ID)
+	s.writeDesktopSsoSessionResponse(w, r, user, authMethod)
+}
+
+func (s *Server) writeDesktopSsoSessionResponse(w http.ResponseWriter, r *http.Request, user User, authMethod string) {
+	jwtToken, err := s.desktopJWTSigner.issue(user, s.now())
+	if err != nil {
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: authMethod, LoginResult: "failure", FailureReason: "jwt_sign_failed"})
+		writeError(w, http.StatusServiceUnavailable, "sso_jwt_not_configured", "Desktop SSO JWT signer is not configured.")
+		return
+	}
+
+	sessionToken, sessionExpiresAt, err := s.createSession(r, user.ID)
 	if err != nil {
 		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: authMethod, LoginResult: "failure", FailureReason: "session_create_failed"})
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
@@ -679,13 +679,16 @@ func (s *Server) desktopSsoTicketSession(w http.ResponseWriter, r *http.Request,
 	user.LastLoginAt = &now
 	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: authMethod, LoginResult: "success"})
 
-	http.SetCookie(w, s.sessionCookie(token, expiresAt))
+	http.SetCookie(w, s.sessionCookie(sessionToken, sessionExpiresAt))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"user":        publicUser(user),
-		"accessToken": token,
+		"accessToken": jwtToken.Token,
 		"tokenType":   "Bearer",
-		"expiresAt":   expiresAt,
+		"expiresAt":   jwtToken.ExpiresAt,
+		"issuer":      jwtToken.Issuer,
+		"audience":    jwtToken.Audiences,
+		"scope":       jwtToken.Scope,
 	})
 }
 

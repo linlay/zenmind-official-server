@@ -3,10 +3,16 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -659,17 +665,31 @@ func TestDesktopSSOStartCreatesTicketAndBearerSession(t *testing.T) {
 	if accessToken == "" || exchangeBody["tokenType"] != "Bearer" {
 		t.Fatalf("unexpected token exchange body: %#v", exchangeBody)
 	}
+	claims := decodeTestJWTClaims(t, accessToken)
+	if claims["iss"] != "https://official.example.test" || claims["sub"] != "user:2" || claims["email"] != "desktop.user@example.com" || claims["role"] != "user" {
+		t.Fatalf("unexpected JWT claims: %#v", claims)
+	}
+	if claims["scope"] != desktopSsoScope || claims["auth_provider"] != "authentik" || claims["auth_sub"] != "desktop-authentik-subject" {
+		t.Fatalf("unexpected JWT identity claims: %#v", claims)
+	}
+	audiences, _ := claims["aud"].([]any)
+	if len(audiences) != 2 || audiences[0] != "zenmind-market-server" || audiences[1] != "zenmind-tunnel-hub-server" {
+		t.Fatalf("unexpected JWT audience: %#v", claims["aud"])
+	}
+	if int64(claims["exp"].(float64)-claims["iat"].(float64)) != int64(24*time.Hour/time.Second) {
+		t.Fatalf("unexpected JWT ttl: %#v", claims)
+	}
 	cookies := exchangeRec.Result().Cookies()
 	if len(cookies) != 1 || cookies[0].Name != "test_session" || !cookies[0].HttpOnly {
 		t.Fatalf("unexpected desktop SSO cookies: %#v", cookies)
 	}
 
 	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
-	meReq.Header.Set("Authorization", "Bearer "+accessToken)
+	meReq.AddCookie(cookies[0])
 	meRec := httptest.NewRecorder()
 	handler.ServeHTTP(meRec, meReq)
 	if meRec.Code != http.StatusOK {
-		t.Fatalf("bearer me status = %d body = %s", meRec.Code, meRec.Body.String())
+		t.Fatalf("cookie me status = %d body = %s", meRec.Code, meRec.Body.String())
 	}
 
 	secondReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"ticket":"`+ticket+`"}`))
@@ -784,6 +804,32 @@ func TestDesktopSSOSessionCreatesSessionFromTicket(t *testing.T) {
 	}
 }
 
+func TestDesktopSSOSessionRejectsMissingJWTSigner(t *testing.T) {
+	handler, store := testHandlerWithoutDesktopJWT(t)
+	user, err := store.UpsertAuthentikUser(context.Background(), AuthentikIdentity{
+		Subject: "missing-jwt-subject",
+		Email:   "missing-jwt@example.com",
+		Name:    "Missing JWT",
+	}, "")
+	if err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	ticket := "missing-jwt-ticket"
+	if err := store.SaveDesktopSsoTicket(context.Background(), user.ID, tokenHash(ticket), time.Now().UTC().Add(time.Minute), "", ""); err != nil {
+		t.Fatalf("save ticket: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"ticket":"`+ticket+`"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("missing JWT signer should not set cookies: %#v", rec.Result().Cookies())
+	}
+}
+
 func TestDesktopSSOTicketCanOnlyBeConsumedOnce(t *testing.T) {
 	handler, _ := testHandler(t)
 	ticket := createDesktopTicketFromGoogleLogin(t, handler)
@@ -882,14 +928,18 @@ func TestDesktopSSOSessionCreatesSessionFromGoogleIDToken(t *testing.T) {
 	}
 
 	var body struct {
-		OK   bool           `json:"ok"`
-		User map[string]any `json:"user"`
+		OK          bool           `json:"ok"`
+		User        map[string]any `json:"user"`
+		AccessToken string         `json:"accessToken"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode desktop SSO response: %v", err)
 	}
 	if !body.OK || body.User["email"] != "desktop-user@example.com" {
 		t.Fatalf("unexpected desktop SSO response: %#v", body)
+	}
+	if claims := decodeTestJWTClaims(t, body.AccessToken); claims["auth_provider"] != "google" || claims["email"] != "desktop-user@example.com" {
+		t.Fatalf("unexpected google desktop JWT claims: %#v", claims)
 	}
 
 	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
@@ -921,19 +971,33 @@ func TestDesktopSSOSessionRejectsInvalidGoogleIDToken(t *testing.T) {
 
 func testHandler(t *testing.T) (http.Handler, *memoryStore) {
 	t.Helper()
+	return testHandlerWithDesktopJWT(t, true)
+}
+
+func testHandlerWithoutDesktopJWT(t *testing.T) (http.Handler, *memoryStore) {
+	t.Helper()
+	return testHandlerWithDesktopJWT(t, false)
+}
+
+func testHandlerWithDesktopJWT(t *testing.T, includeDesktopJWT bool) (http.Handler, *memoryStore) {
+	t.Helper()
 
 	store := newMemoryStore()
 	if err := EnsureInitialAdmin(context.Background(), store, "admin@zenmind.cc", "correct-password"); err != nil {
 		t.Fatalf("init admin: %v", err)
 	}
-	server := NewServer(store, ServerOptions{
+	options := ServerOptions{
 		CookieName:     "test_session",
 		SessionTTL:     time.Hour,
 		Google:         fakeGoogleProvider{},
 		AuthSuccessURL: "http://localhost:5173/login",
 		AuthFailureURL: "http://localhost:5173/login",
 		SSOBridgeToken: "test-sso-bridge-token",
-	})
+	}
+	if includeDesktopJWT {
+		options.DesktopJWT = testDesktopJWTConfig(t)
+	}
+	server := NewServer(store, options)
 	return server.Routes(), store
 }
 
@@ -952,9 +1016,56 @@ func testHandlerWithMailer(t *testing.T) (http.Handler, *memoryStore, *fakeMaile
 		AuthSuccessURL: "http://localhost:5173/login",
 		AuthFailureURL: "http://localhost:5173/login",
 		SSOBridgeToken: "test-sso-bridge-token",
+		DesktopJWT:     testDesktopJWTConfig(t),
 		Mailer:         mailer,
 	})
 	return server.Routes(), store, mailer
+}
+
+func testDesktopJWTConfig(t *testing.T) DesktopJWTConfig {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate test RSA key: %v", err)
+	}
+	return DesktopJWTConfig{
+		PrivateKeyPEM: string(pem.EncodeToMemory(&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+		})),
+		Issuer:    "https://official.example.test",
+		Audiences: []string{"zenmind-market-server", "zenmind-tunnel-hub-server"},
+		KeyID:     "test-key",
+		TTL:       24 * time.Hour,
+	}
+}
+
+func decodeTestJWTClaims(t *testing.T, token string) map[string]any {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("token is not a JWT: %q", token)
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("decode JWT header: %v", err)
+	}
+	var header map[string]any
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		t.Fatalf("parse JWT header: %v", err)
+	}
+	if header["alg"] != "RS256" || header["kid"] != "test-key" {
+		t.Fatalf("unexpected JWT header: %#v", header)
+	}
+	claimsJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode JWT claims: %v", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(claimsJSON, &claims); err != nil {
+		t.Fatalf("parse JWT claims: %v", err)
+	}
+	return claims
 }
 
 func cookiesByName(cookies []*http.Cookie) map[string]*http.Cookie {
