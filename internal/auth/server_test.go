@@ -608,15 +608,114 @@ func TestAuthentikSSOSessionRejectsExternalRedirect(t *testing.T) {
 	}
 }
 
-func TestDesktopSSOStartRejectsUntrustedBridge(t *testing.T) {
+func TestDesktopSSOStartRedirectsToContinueAndSetsBridgeCookies(t *testing.T) {
+	handler, _ := testHandler(t)
+	callbackURL := "http://localhost:43123/api/auth/oidc/callback"
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/desktop-sso/start?callback="+url.QueryEscape(callbackURL)+"&state=desktop-state", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Location") != "/api/auth/desktop-sso/continue" {
+		t.Fatalf("unexpected continue redirect: %q", rec.Header().Get("Location"))
+	}
+	cookies := cookiesByName(rec.Result().Cookies())
+	callbackCookie := cookies["test_session_desktop_sso_bridge_callback"]
+	if callbackCookie == nil || callbackCookie.Value != callbackURL || !callbackCookie.HttpOnly || callbackCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unexpected bridge callback cookie: %#v", callbackCookie)
+	}
+	stateCookie := cookies["test_session_desktop_sso_bridge_state"]
+	if stateCookie == nil || stateCookie.Value != "desktop-state" || !stateCookie.HttpOnly || stateCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unexpected bridge state cookie: %#v", stateCookie)
+	}
+}
+
+func TestDesktopSSOStartRejectsMissingState(t *testing.T) {
 	handler, _ := testHandler(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/auth/desktop-sso/start?callback="+url.QueryEscape("http://localhost:43123/api/auth/oidc/callback")+"&state=desktop-state", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/desktop-sso/start?callback="+url.QueryEscape("http://localhost:43123/api/auth/oidc/callback"), nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDesktopSSOContinueRejectsUntrustedBridge(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/desktop-sso/continue", nil)
+	req.AddCookie(&http.Cookie{Name: "test_session_desktop_sso_bridge_callback", Value: "http://localhost:43123/api/auth/oidc/callback"})
+	req.AddCookie(&http.Cookie{Name: "test_session_desktop_sso_bridge_state", Value: "desktop-state"})
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDesktopSSOContinueRejectsMissingBridgeCookies(t *testing.T) {
+	handler, _ := testHandler(t)
+
+	req := authentikSSORequest("/api/auth/desktop-sso/continue", "desktop-authentik-subject", "desktop.user@example.com", "Desktop User")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDesktopSSOContinueCreatesTicketFromBridgeCookies(t *testing.T) {
+	handler, _ := testHandler(t)
+	callbackURL := "http://localhost:43123/api/auth/oidc/callback"
+
+	startReq := httptest.NewRequest(http.MethodGet, "/api/auth/desktop-sso/start?callback="+url.QueryEscape(callbackURL)+"&state=desktop-state", nil)
+	startRec := httptest.NewRecorder()
+	handler.ServeHTTP(startRec, startReq)
+	if startRec.Code != http.StatusFound {
+		t.Fatalf("start status = %d body = %s", startRec.Code, startRec.Body.String())
+	}
+
+	continueReq := authentikSSORequest(
+		"/api/auth/desktop-sso/continue",
+		"desktop-authentik-subject",
+		"desktop.user@example.com",
+		"Desktop User",
+	)
+	for _, cookie := range startRec.Result().Cookies() {
+		continueReq.AddCookie(cookie)
+	}
+	continueRec := httptest.NewRecorder()
+	handler.ServeHTTP(continueRec, continueReq)
+
+	if continueRec.Code != http.StatusFound {
+		t.Fatalf("continue status = %d body = %s", continueRec.Code, continueRec.Body.String())
+	}
+	location, err := url.Parse(continueRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse desktop redirect: %v", err)
+	}
+	if location.Scheme != "http" || location.Host != "localhost:43123" || location.Path != "/api/auth/oidc/callback" {
+		t.Fatalf("unexpected desktop redirect %q", continueRec.Header().Get("Location"))
+	}
+	if location.Query().Get("state") != "desktop-state" {
+		t.Fatalf("unexpected desktop state %q", location.Query().Get("state"))
+	}
+	if location.Query().Get("ticket") == "" {
+		t.Fatalf("missing desktop ticket in %q", continueRec.Header().Get("Location"))
+	}
+	cookies := cookiesByName(continueRec.Result().Cookies())
+	if callbackCookie := cookies["test_session_desktop_sso_bridge_callback"]; callbackCookie == nil || callbackCookie.MaxAge != -1 {
+		t.Fatalf("expected bridge callback cookie to be cleared: %#v", callbackCookie)
+	}
+	if stateCookie := cookies["test_session_desktop_sso_bridge_state"]; stateCookie == nil || stateCookie.MaxAge != -1 {
+		t.Fatalf("expected bridge state cookie to be cleared: %#v", stateCookie)
 	}
 }
 

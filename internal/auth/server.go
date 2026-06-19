@@ -126,6 +126,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/auth/google/callback", s.googleCallback)
 	mux.HandleFunc("GET /api/auth/google/desktop/start", s.googleDesktopStart)
 	mux.HandleFunc("GET /api/auth/desktop-sso/start", s.desktopSsoStart)
+	mux.HandleFunc("GET /api/auth/desktop-sso/continue", s.desktopSsoContinue)
 	mux.HandleFunc("POST /api/auth/desktop-sso/session", s.desktopSsoSession)
 	mux.HandleFunc("GET /api/auth/sso/session", s.authentikSsoSession)
 	mux.HandleFunc("GET /api/auth/me", s.me)
@@ -537,12 +538,6 @@ func (s *Server) googleDesktopCallback(w http.ResponseWriter, r *http.Request, d
 }
 
 func (s *Server) desktopSsoStart(w http.ResponseWriter, r *http.Request) {
-	if s.ssoBridgeToken == "" || strings.TrimSpace(r.Header.Get("X-ZenMind-SSO-Bridge-Token")) != s.ssoBridgeToken {
-		s.recordLogin(r, LoginLog{AuthMethod: s.desktopSSOAuthMethod(), LoginResult: "failure", FailureReason: "untrusted_bridge"})
-		writeError(w, http.StatusUnauthorized, "untrusted_bridge", "Desktop SSO bridge is not trusted.")
-		return
-	}
-
 	callbackURL := strings.TrimSpace(r.URL.Query().Get("callback"))
 	desktopState := strings.TrimSpace(r.URL.Query().Get("state"))
 	if !isAllowedDesktopCallbackURL(callbackURL) || desktopState == "" {
@@ -555,6 +550,38 @@ func (s *Server) desktopSsoStart(w http.ResponseWriter, r *http.Request) {
 		DesktopState: desktopState,
 	}
 
+	// Compatibility path for the old nginx config that protected /start directly.
+	if s.isTrustedDesktopSsoBridgeRequest(r) {
+		s.completeDesktopSsoBridge(w, r, desktopContext)
+		return
+	}
+
+	http.SetCookie(w, s.desktopSsoBridgeCookie(s.desktopSsoBridgeCallbackCookieName(), callbackURL))
+	http.SetCookie(w, s.desktopSsoBridgeCookie(s.desktopSsoBridgeStateCookieName(), desktopState))
+	http.Redirect(w, r, "/api/auth/desktop-sso/continue", http.StatusFound)
+}
+
+func (s *Server) desktopSsoContinue(w http.ResponseWriter, r *http.Request) {
+	if !s.isTrustedDesktopSsoBridgeRequest(r) {
+		s.clearDesktopSsoBridgeCookies(w)
+		s.recordLogin(r, LoginLog{AuthMethod: s.desktopSSOAuthMethod(), LoginResult: "failure", FailureReason: "untrusted_bridge"})
+		writeError(w, http.StatusUnauthorized, "untrusted_bridge", "Desktop SSO bridge is not trusted.")
+		return
+	}
+
+	desktopContext, ok, err := s.readDesktopSsoBridgeContext(r)
+	if !ok || err != nil {
+		s.clearDesktopSsoBridgeCookies(w)
+		s.recordLogin(r, LoginLog{AuthMethod: s.desktopSSOAuthMethod(), LoginResult: "failure", FailureReason: "invalid_desktop_callback"})
+		writeError(w, http.StatusBadRequest, "invalid_request", "Desktop callback and state are required.")
+		return
+	}
+
+	s.clearDesktopSsoBridgeCookies(w)
+	s.completeDesktopSsoBridge(w, r, desktopContext)
+}
+
+func (s *Server) completeDesktopSsoBridge(w http.ResponseWriter, r *http.Request, desktopContext desktopOAuthContext) {
 	identity := authentikIdentityFromRequest(r)
 	if strings.TrimSpace(identity.Subject) == "" || !validEmail(identity.Email) {
 		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: s.desktopSSOAuthMethod(), LoginResult: "failure", FailureReason: "missing_identity"})
@@ -922,6 +949,10 @@ func (s *Server) desktopSSOAuthMethod() string {
 	return "desktop_" + normalizeDesktopSSOProvider(s.desktopSSOProvider)
 }
 
+func (s *Server) isTrustedDesktopSsoBridgeRequest(r *http.Request) bool {
+	return s.ssoBridgeToken != "" && strings.TrimSpace(r.Header.Get("X-ZenMind-SSO-Bridge-Token")) == s.ssoBridgeToken
+}
+
 func (s *Server) sessionCookie(token string, expiresAt time.Time) *http.Cookie {
 	return &http.Cookie{
 		Name:     s.cookieName,
@@ -1017,6 +1048,51 @@ func (s *Server) desktopOAuthCookie(name, value string) *http.Cookie {
 		Secure:   s.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
 	}
+}
+
+func (s *Server) desktopSsoBridgeCallbackCookieName() string {
+	return s.cookieName + "_desktop_sso_bridge_callback"
+}
+
+func (s *Server) desktopSsoBridgeStateCookieName() string {
+	return s.cookieName + "_desktop_sso_bridge_state"
+}
+
+func (s *Server) desktopSsoBridgeCookie(name, value string) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		Expires:  s.now().UTC().Add(10 * time.Minute),
+		MaxAge:   int((10 * time.Minute).Seconds()),
+		HttpOnly: true,
+		Secure:   s.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+func (s *Server) clearDesktopSsoBridgeCookies(w http.ResponseWriter) {
+	http.SetCookie(w, s.expiredNamedCookie(s.desktopSsoBridgeCallbackCookieName()))
+	http.SetCookie(w, s.expiredNamedCookie(s.desktopSsoBridgeStateCookieName()))
+}
+
+func (s *Server) readDesktopSsoBridgeContext(r *http.Request) (desktopOAuthContext, bool, error) {
+	callbackCookie, callbackErr := r.Cookie(s.desktopSsoBridgeCallbackCookieName())
+	desktopStateCookie, desktopStateErr := r.Cookie(s.desktopSsoBridgeStateCookieName())
+	if callbackErr != nil && desktopStateErr != nil {
+		return desktopOAuthContext{}, false, nil
+	}
+	if callbackErr != nil || desktopStateErr != nil {
+		return desktopOAuthContext{}, true, fmt.Errorf("missing desktop sso bridge cookie")
+	}
+	context := desktopOAuthContext{
+		CallbackURL:  strings.TrimSpace(callbackCookie.Value),
+		DesktopState: strings.TrimSpace(desktopStateCookie.Value),
+	}
+	if context.DesktopState == "" || !isAllowedDesktopCallbackURL(context.CallbackURL) {
+		return desktopOAuthContext{}, true, fmt.Errorf("invalid desktop sso bridge cookie")
+	}
+	return context, true, nil
 }
 
 func (s *Server) clearDesktopOAuthCookies(w http.ResponseWriter) {
