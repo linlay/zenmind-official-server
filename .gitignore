@@ -3,5 +3,7 @@ bin
 tmp
 data/*
 !data/.gitkeep
+configs/secrets/*
+!configs/secrets/.gitkeep
 *.log
 .DS_Store

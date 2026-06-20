@@ -35,6 +35,12 @@ Copy `.env.example` and provide production values before deployment.
 cp .env.example .env
 ```
 
+Configuration and runtime files are split by responsibility:
+
+- `.env` is the main local and deployment configuration entrypoint; it is not committed.
+- `configs/` stores file-based configuration referenced by `.env`, such as PEM files.
+- `data/` stores runtime data only, such as the SQLite site data store and WAL files.
+
 Required values:
 
 - `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`
@@ -44,7 +50,7 @@ Required values:
 - `SSO_BRIDGE_TOKEN` matching the website nginx bridge token for authentik forward-auth sessions
 - `DESKTOP_SSO_PROVIDER`, defaulting to `authentik`
 - `DESKTOP_SSO_TICKET_TTL`, defaulting to `2m`
-- `SSO_JWT_PRIVATE_KEY_FILE` or `SSO_JWT_PRIVATE_KEY_PEM`, plus explicit `SSO_JWT_ISSUER`, for Desktop bridge JWT signing
+- `SSO_JWT_PRIVATE_KEY_FILE` or `SSO_JWT_PRIVATE_KEY_PEM`, plus explicit `SSO_JWT_ISSUER`, for Desktop bridge JWT signing. The default file path is `/configs/secrets/zenmind-sso-jwt-private.pem` in the container.
 - `SSO_JWT_AUDIENCES`, defaulting to `zenmind-market-server,zenmind-tunnel-hub-server`; `SSO_JWT_TTL`, defaulting to `24h`; `SSO_JWT_KEY_ID`, defaulting to `default`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
@@ -81,7 +87,7 @@ docker compose up --build
 ```
 
 The `server` service joins `zenmind-official-net` as `zenmind-official-server`. The host port defaults to `8080` and can be overridden with `SERVER_PORT`.
-The SQLite site data store is persisted through `./data:/data`; override the container user with `SERVER_USER` if the host deployment user is not `1000:1000`.
+The SQLite site data store is persisted through `./data:/data`, and file-based configuration is mounted read-only through `./configs:/configs:ro`; override the container user with `SERVER_USER` if the host deployment user is not `1000:1000`.
 
 ## Installer releases
 
