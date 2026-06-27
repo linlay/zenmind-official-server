@@ -59,7 +59,6 @@ Required values:
 Optional values:
 
 - `GOOGLE_DESKTOP_CLIENT_ID` when the desktop app uses a separate Google OAuth client id
-- `INSTALLER_DB_PATH` as a legacy fallback for existing deployments that still point to `/data/installers.sqlite`
 
 For Gmail delivery, set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USERNAME=linlay.zenmind@gmail.com`, `SMTP_FROM=linlay.zenmind@gmail.com`, and use a Google App Password as `SMTP_PASSWORD`. Do not use the normal Google account password.
 

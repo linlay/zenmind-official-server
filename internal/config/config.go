@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,9 +11,7 @@ import (
 
 const (
 	defaultSQLiteDBPath = "/data/data.sqlite"
-	legacySQLiteDBPath  = "/data/installers.sqlite"
 	sqliteDBPathEnv     = "SQLITE_DB_PATH"
-	installerDBPathEnv  = "INSTALLER_DB_PATH"
 )
 
 type Config struct {
@@ -48,11 +45,9 @@ type Config struct {
 	MarketServerURL      string
 	MarketProxyToken     string
 	SQLiteDBPath         string
-	SQLiteDBPathLegacy   bool
 }
 
 func FromEnv() (Config, error) {
-	sqliteDBPath, sqliteDBPathLegacy := resolveSQLiteDBPath()
 	cfg := Config{
 		Addr:                 env("APP_ADDR", ":8080"),
 		CookieName:           env("COOKIE_NAME", "zenmind_session"),
@@ -80,8 +75,7 @@ func FromEnv() (Config, error) {
 		SMTPFrom:             env("SMTP_FROM", "linlay.zenmind@gmail.com"),
 		MarketServerURL:      strings.TrimRight(env("MARKET_SERVER_URL", "http://zenmind-market-server:8088"), "/"),
 		MarketProxyToken:     os.Getenv("MARKET_PROXY_TOKEN"),
-		SQLiteDBPath:         sqliteDBPath,
-		SQLiteDBPathLegacy:   sqliteDBPathLegacy,
+		SQLiteDBPath:         env(sqliteDBPathEnv, defaultSQLiteDBPath),
 	}
 
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
@@ -104,24 +98,6 @@ func FromEnv() (Config, error) {
 	}
 
 	return cfg, nil
-}
-
-func resolveSQLiteDBPath() (string, bool) {
-	if value := strings.TrimSpace(os.Getenv(sqliteDBPathEnv)); value != "" {
-		return filepath.Clean(value), false
-	}
-	if value := strings.TrimSpace(os.Getenv(installerDBPathEnv)); value != "" {
-		return filepath.Clean(value), true
-	}
-	if fileExists(legacySQLiteDBPath) && !fileExists(defaultSQLiteDBPath) {
-		return legacySQLiteDBPath, true
-	}
-	return defaultSQLiteDBPath, false
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }
 
 func env(key, fallback string) string {

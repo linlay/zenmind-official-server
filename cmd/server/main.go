@@ -44,10 +44,6 @@ func run() error {
 		return err
 	}
 
-	if cfg.SQLiteDBPathLegacy {
-		log.Printf("Using legacy SQLite database path %s. Set SQLITE_DB_PATH=/data/data.sqlite after migrating the existing database file.", cfg.SQLiteDBPath)
-	}
-
 	installerCatalog, err := release.OpenSQLite(ctx, cfg.SQLiteDBPath)
 	if err != nil {
 		return err

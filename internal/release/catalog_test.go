@@ -10,7 +10,7 @@ import (
 
 func TestSQLiteCatalogUpsertListAndRejectsInvalidKey(t *testing.T) {
 	ctx := context.Background()
-	catalog, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "installers.sqlite"))
+	catalog, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "data.sqlite"))
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}

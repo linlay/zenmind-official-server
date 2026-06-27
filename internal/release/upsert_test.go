@@ -20,7 +20,7 @@ func TestUpsertFileCopiesInstallerAndWritesCatalog(t *testing.T) {
 	}
 
 	installer, err := UpsertFile(ctx, UpsertFileOptions{
-		DBPath:      filepath.Join(tempDir, "installers.sqlite"),
+		DBPath:      filepath.Join(tempDir, "data.sqlite"),
 		ReleaseRoot: filepath.Join(tempDir, "releases"),
 		Key:         "windows",
 		Version:     "0.2.4",
@@ -74,7 +74,7 @@ func TestUpsertFileRejectsConflictingTargetWithoutReplace(t *testing.T) {
 	}
 
 	_, err := UpsertFile(ctx, UpsertFileOptions{
-		DBPath:      filepath.Join(tempDir, "installers.sqlite"),
+		DBPath:      filepath.Join(tempDir, "data.sqlite"),
 		ReleaseRoot: filepath.Join(tempDir, "releases"),
 		Key:         "windows",
 		Version:     "0.2.4",
@@ -86,7 +86,7 @@ func TestUpsertFileRejectsConflictingTargetWithoutReplace(t *testing.T) {
 	}
 
 	installer, err := UpsertFile(ctx, UpsertFileOptions{
-		DBPath:      filepath.Join(tempDir, "installers.sqlite"),
+		DBPath:      filepath.Join(tempDir, "data.sqlite"),
 		ReleaseRoot: filepath.Join(tempDir, "releases"),
 		Key:         "windows",
 		Version:     "0.2.4",
@@ -120,7 +120,7 @@ func TestUpsertFileRepairsExistingFileMode(t *testing.T) {
 	}
 
 	if _, err := UpsertFile(ctx, UpsertFileOptions{
-		DBPath:      filepath.Join(tempDir, "installers.sqlite"),
+		DBPath:      filepath.Join(tempDir, "data.sqlite"),
 		ReleaseRoot: filepath.Join(tempDir, "releases"),
 		Key:         "mac",
 		Version:     "0.2.4",
