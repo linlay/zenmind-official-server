@@ -5,10 +5,14 @@ Go 1.26 backend for the ZenMind official site login flow.
 ## Features
 
 - MySQL-backed users and sessions
+- Google OIDC with server-side State, Nonce, and PKCE verification
+- Email verification-code login and verified-email identity linking
 - Initial administrator bootstrap from environment variables
 - bcrypt password verification
-- HttpOnly SameSite=Lax cookie sessions
-- authentik forward-auth session bridge
+- 24-hour Secure, HttpOnly, SameSite=Lax, host-only cookie sessions
+- One-time Desktop tickets and 12-hour multi-service JWTs
+- Same-origin Market gateway with 90-second Market-only JWTs
+- Temporary Authentik forward-auth bridge for rollback only
 
 ## API
 
@@ -20,10 +24,14 @@ Go 1.26 backend for the ZenMind official site login flow.
 - `GET /api/auth/google/callback`
 - `GET /api/auth/google/desktop/start`
 - `GET /api/auth/desktop-sso/start`
+- `GET /api/auth/desktop-sso/continue`
 - `POST /api/auth/desktop-sso/session`
+- `POST /api/auth/desktop-sso/token`
 - `GET /api/auth/sso/session`
+- `GET /api/auth/csrf`
 - `GET /api/auth/me`
 - `POST /api/auth/logout`
+- `/api/market/*`
 - `GET /api/downloads/stats`
 - `POST /api/downloads/events`
 
@@ -47,11 +55,13 @@ Required values:
 - `INIT_ADMIN_EMAIL`, `INIT_ADMIN_PASSWORD`
 - `COOKIE_NAME`, `COOKIE_SECURE`, `SESSION_TTL`
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL`
-- `SSO_BRIDGE_TOKEN` matching the website nginx bridge token for authentik forward-auth sessions
-- `DESKTOP_SSO_PROVIDER`, defaulting to `authentik`
+- `SSO_BRIDGE_TOKEN` matching the website nginx bridge token only while the Authentik rollback bridge remains enabled
+- `DESKTOP_SSO_PROVIDER`, defaulting to `first_party`
 - `DESKTOP_SSO_TICKET_TTL`, defaulting to `2m`
-- `SSO_JWT_PRIVATE_KEY_FILE` or `SSO_JWT_PRIVATE_KEY_PEM`, plus explicit `SSO_JWT_ISSUER`, for Desktop bridge JWT signing. The default file path is `/configs/secrets/zenmind-sso-jwt-private.pem` in the container.
-- `SSO_JWT_AUDIENCES`, defaulting to `zenmind-market-server,zenmind-tunnel-hub-server`; `SSO_JWT_TTL`, defaulting to `24h`; `SSO_JWT_KEY_ID`, defaulting to `default`
+- `SSO_JWT_PRIVATE_KEY_FILE` or `SSO_JWT_PRIVATE_KEY_PEM`, plus explicit `SSO_JWT_ISSUER`, for Desktop and Market gateway JWT signing. The default file path is `/configs/secrets/zenmind-sso-jwt-private.pem` in the container.
+- `SSO_JWT_AUDIENCES`, defaulting to `market,tunnel,kanban,zenmind-im-server`; `SSO_JWT_TTL`, defaulting to `12h`; `SSO_JWT_KEY_ID`, defaulting to `default`
+- `MARKET_SERVER_URL`, `MARKET_JWT_AUDIENCE=market`, and `MARKET_JWT_TTL=90s`
+- `TRUSTED_PROXY_CIDRS`, restricted to the deployment Docker network such as `172.20.0.0/16`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
 - `SQLITE_DB_PATH` for the local SQLite site data store, defaulting to `/data/data.sqlite` in the container
@@ -59,6 +69,10 @@ Required values:
 Optional values:
 
 - `GOOGLE_DESKTOP_CLIENT_ID` when the desktop app uses a separate Google OAuth client id
+
+The Google web client must register the exact callback configured by
+`GOOGLE_REDIRECT_URL`; production uses
+`https://www.zenmind.cc/api/auth/google/callback`.
 
 For Gmail delivery, set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USERNAME=linlay.zenmind@gmail.com`, `SMTP_FROM=linlay.zenmind@gmail.com`, and use a Google App Password as `SMTP_PASSWORD`. Do not use the normal Google account password.
 
