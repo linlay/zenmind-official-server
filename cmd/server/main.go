@@ -63,9 +63,10 @@ func run() error {
 	}
 
 	app := auth.NewServer(store, auth.ServerOptions{
-		CookieName:   cfg.CookieName,
-		CookieSecure: cfg.CookieSecure,
-		SessionTTL:   cfg.SessionTTL,
+		CookieName:        cfg.CookieName,
+		CookieSecure:      cfg.CookieSecure,
+		SessionTTL:        cfg.SessionTTL,
+		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 		Google: auth.NewGoogleProvider(auth.GoogleProviderConfig{
 			ClientID:        cfg.GoogleClientID,
 			ClientSecret:    cfg.GoogleSecret,
@@ -74,6 +75,7 @@ func run() error {
 		}),
 		AuthSuccessURL:     cfg.AuthSuccessURL,
 		AuthFailureURL:     cfg.AuthFailureURL,
+		AuthLoginURL:       cfg.AuthLoginURL,
 		SSOBridgeToken:     cfg.SSOBridgeToken,
 		DesktopSSOProvider: cfg.DesktopSSOProvider,
 		DesktopTicketTTL:   cfg.DesktopSSOTicketTTL,
@@ -85,10 +87,12 @@ func run() error {
 			KeyID:          cfg.SSOJWTKeyID,
 			TTL:            cfg.SSOJWTTTL,
 		},
-		MarketServerURL:  cfg.MarketServerURL,
-		MarketProxyToken: cfg.MarketProxyToken,
-		InstallerCatalog: installerCatalog,
-		DownloadStore:    downloadStore,
+		MarketServerURL:   cfg.MarketServerURL,
+		MarketProxyToken:  cfg.MarketProxyToken,
+		MarketJWTAudience: cfg.MarketJWTAudience,
+		MarketJWTTTL:      cfg.MarketJWTTTL,
+		InstallerCatalog:  installerCatalog,
+		DownloadStore:     downloadStore,
 		Mailer: auth.NewSMTPMailer(auth.SMTPMailerConfig{
 			Host:     cfg.SMTPHost,
 			Port:     cfg.SMTPPort,

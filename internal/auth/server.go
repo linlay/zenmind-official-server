@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
@@ -28,18 +27,24 @@ type Server struct {
 	cookieName         string
 	cookieSecure       bool
 	sessionTTL         time.Duration
+	trustedProxyCIDRs  []netip.Prefix
 	google             GoogleProvider
+	authLoginURL       string
+	authOrigin         string
 	authSuccessURL     string
 	authFailureURL     string
 	ssoBridgeToken     string
 	desktopSSOProvider string
 	desktopTicketTTL   time.Duration
-	desktopJWTSigner   *desktopJWTSigner
+	desktopJWTSigner   *identityJWTSigner
 	marketServerURL    string
 	marketProxyToken   string
+	marketJWTAudience  string
+	marketJWTTTL       time.Duration
 	mailer             Mailer
 	installerCatalog   release.Catalog
 	downloadStore      DownloadStore
+	rateLimiter        *rateLimiter
 	now                func() time.Time
 }
 
@@ -47,7 +52,9 @@ type ServerOptions struct {
 	CookieName         string
 	CookieSecure       bool
 	SessionTTL         time.Duration
+	TrustedProxyCIDRs  []string
 	Google             GoogleProvider
+	AuthLoginURL       string
 	AuthSuccessURL     string
 	AuthFailureURL     string
 	SSOBridgeToken     string
@@ -56,6 +63,8 @@ type ServerOptions struct {
 	DesktopJWT         DesktopJWTConfig
 	MarketServerURL    string
 	MarketProxyToken   string
+	MarketJWTAudience  string
+	MarketJWTTTL       time.Duration
 	Mailer             Mailer
 	InstallerCatalog   release.Catalog
 	DownloadStore      DownloadStore
@@ -73,6 +82,18 @@ func NewServer(store Store, opts ServerOptions) *Server {
 	desktopTicketTTL := opts.DesktopTicketTTL
 	if desktopTicketTTL <= 0 {
 		desktopTicketTTL = 2 * time.Minute
+	}
+	authLoginURL := strings.TrimSpace(opts.AuthLoginURL)
+	if authLoginURL == "" {
+		authLoginURL = "/login"
+	}
+	marketJWTAudience := strings.TrimSpace(opts.MarketJWTAudience)
+	if marketJWTAudience == "" {
+		marketJWTAudience = "market"
+	}
+	marketJWTTTL := opts.MarketJWTTTL
+	if marketJWTTTL <= 0 {
+		marketJWTTTL = 90 * time.Second
 	}
 	google := opts.Google
 	if google == nil {
@@ -96,18 +117,24 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		cookieName:         cookieName,
 		cookieSecure:       opts.CookieSecure,
 		sessionTTL:         sessionTTL,
+		trustedProxyCIDRs:  parseTrustedProxyCIDRs(opts.TrustedProxyCIDRs),
 		google:             google,
+		authLoginURL:       safeRelativeRedirect(authLoginURL),
+		authOrigin:         originFromURL(opts.AuthSuccessURL),
 		authSuccessURL:     strings.TrimSpace(opts.AuthSuccessURL),
 		authFailureURL:     strings.TrimSpace(opts.AuthFailureURL),
 		ssoBridgeToken:     strings.TrimSpace(opts.SSOBridgeToken),
 		desktopSSOProvider: normalizeDesktopSSOProvider(opts.DesktopSSOProvider),
 		desktopTicketTTL:   desktopTicketTTL,
-		desktopJWTSigner:   newDesktopJWTSigner(opts.DesktopJWT),
+		desktopJWTSigner:   newIdentityJWTSigner(opts.DesktopJWT),
 		marketServerURL:    strings.TrimRight(strings.TrimSpace(opts.MarketServerURL), "/"),
 		marketProxyToken:   strings.TrimSpace(opts.MarketProxyToken),
+		marketJWTAudience:  marketJWTAudience,
+		marketJWTTTL:       marketJWTTTL,
 		mailer:             mailer,
 		installerCatalog:   opts.InstallerCatalog,
 		downloadStore:      downloadStore,
+		rateLimiter:        newRateLimiter(),
 		now:                time.Now,
 	}
 }
@@ -128,10 +155,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/auth/desktop-sso/start", s.desktopSsoStart)
 	mux.HandleFunc("GET /api/auth/desktop-sso/continue", s.desktopSsoContinue)
 	mux.HandleFunc("POST /api/auth/desktop-sso/session", s.desktopSsoSession)
+	mux.HandleFunc("POST /api/auth/desktop-sso/token", s.desktopSsoToken)
 	mux.HandleFunc("GET /api/auth/sso/session", s.authentikSsoSession)
+	mux.HandleFunc("GET /api/auth/csrf", s.csrf)
 	mux.HandleFunc("GET /api/auth/me", s.me)
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
-	mux.HandleFunc("/api/market/admin/", s.marketAdminProxy)
+	mux.HandleFunc("/api/market/", s.marketProxy)
 	return securityHeaders(mux)
 }
 
@@ -208,9 +237,17 @@ var allowedInstallerKeys = map[string]bool{
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	if !s.requireValidOrigin(w, r) {
+		return
+	}
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid login request.")
+		return
+	}
+	rateKey := "admin:" + s.requestIP(r) + ":" + normalizeEmail(req.Email)
+	if !s.rateLimiter.allow(rateKey, 5, 15*time.Minute, s.now()) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many login attempts. Please try again later.")
 		return
 	}
 
@@ -235,7 +272,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, expiresAt, err := s.createSession(r, user.ID)
+	token, _, expiresAt, err := s.createSession(r, user.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
 		return
@@ -250,6 +287,9 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) emailCodeStart(w http.ResponseWriter, r *http.Request) {
+	if !s.requireValidOrigin(w, r) {
+		return
+	}
 	var req emailCodeStartRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid verification request.")
@@ -258,6 +298,12 @@ func (s *Server) emailCodeStart(w http.ResponseWriter, r *http.Request) {
 	email := normalizeEmail(req.Email)
 	if !validEmail(email) {
 		writeError(w, http.StatusBadRequest, "invalid_email", "Please enter a valid email address.")
+		return
+	}
+	now := s.now()
+	if !s.rateLimiter.allow("email-send:address:"+email, 3, 15*time.Minute, now) ||
+		!s.rateLimiter.allow("email-send:ip:"+s.requestIP(r), 10, 15*time.Minute, now) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many verification requests. Please try again later.")
 		return
 	}
 
@@ -280,6 +326,9 @@ func (s *Server) emailCodeStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) emailCodeVerify(w http.ResponseWriter, r *http.Request) {
+	if !s.requireValidOrigin(w, r) {
+		return
+	}
 	var req emailCodeVerifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid verification request.")
@@ -287,6 +336,10 @@ func (s *Server) emailCodeVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	email := normalizeEmail(req.Email)
 	code := strings.TrimSpace(req.Code)
+	if !s.rateLimiter.allow("email-verify:"+s.requestIP(r)+":"+email, 10, 15*time.Minute, s.now()) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many verification attempts. Please try again later.")
+		return
+	}
 	if !validEmail(email) || !validEmailCode(code) {
 		s.recordLogin(r, LoginLog{Email: email, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "invalid_code"})
 		writeError(w, http.StatusUnauthorized, "invalid_code", "Verification code is incorrect or expired.")
@@ -299,7 +352,7 @@ func (s *Server) emailCodeVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.store.UpsertEmailCodeUser(r.Context(), email, requestIP(r))
+	user, err := s.store.UpsertEmailCodeUser(r.Context(), email, s.requestIP(r))
 	if err != nil {
 		s.recordLogin(r, LoginLog{Email: email, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "user_upsert_failed"})
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save user account.")
@@ -311,7 +364,7 @@ func (s *Server) emailCodeVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, expiresAt, err := s.createSession(r, user.ID)
+	token, _, expiresAt, err := s.createSession(r, user.ID)
 	if err != nil {
 		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "email_code", LoginResult: "failure", FailureReason: "session_create_failed"})
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
@@ -357,6 +410,7 @@ func (s *Server) downloadEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	event := downloadEventFromRequest(r, installerKey, req.Version, s.now().UTC())
+	event.ClientIP = s.requestIP(r)
 	if err := s.downloadStore.RecordDownloadEvent(r.Context(), event); err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to record download event.")
 		return
@@ -370,15 +424,14 @@ func (s *Server) googleStart(w http.ResponseWriter, r *http.Request) {
 		s.redirectFailure(w, r, "google_not_configured")
 		return
 	}
-
-	state, err := randomToken()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", "Unable to start Google login.")
+	if !s.rateLimiter.allow("google:"+s.requestIP(r), 30, 15*time.Minute, s.now()) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many login attempts. Please try again later.")
 		return
 	}
-
-	http.SetCookie(w, s.oauthStateCookie(state))
-	http.Redirect(w, r, s.google.AuthCodeURL(state), http.StatusFound)
+	s.startGoogleOAuth(w, r, OAuthRequest{
+		Kind:     "web",
+		ReturnTo: safeRelativeRedirect(r.URL.Query().Get("return_to")),
+	})
 }
 
 func (s *Server) googleDesktopStart(w http.ResponseWriter, r *http.Request) {
@@ -394,147 +447,105 @@ func (s *Server) googleDesktopStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oauthState, err := randomToken()
+	s.startGoogleOAuth(w, r, OAuthRequest{
+		Kind:         "desktop",
+		CallbackURL:  callbackURL,
+		DesktopState: desktopState,
+	})
+}
+
+func (s *Server) startGoogleOAuth(w http.ResponseWriter, r *http.Request, request OAuthRequest) {
+	state, err := randomToken()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to start Google login.")
 		return
 	}
-
-	http.SetCookie(w, s.desktopOAuthCookie(s.desktopOAuthStateCookieName(), oauthState))
-	http.SetCookie(w, s.desktopOAuthCookie(s.desktopOAuthCallbackCookieName(), callbackURL))
-	http.SetCookie(w, s.desktopOAuthCookie(s.desktopOAuthDesktopStateCookieName(), desktopState))
-	http.Redirect(w, r, s.google.AuthCodeURL(oauthState), http.StatusFound)
+	nonce, err := randomToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to start Google login.")
+		return
+	}
+	codeVerifier, err := randomToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to start Google login.")
+		return
+	}
+	request.Nonce = nonce
+	request.CodeVerifier = codeVerifier
+	request.ExpiresAt = s.now().UTC().Add(10 * time.Minute)
+	if request.ReturnTo == "" {
+		request.ReturnTo = "/"
+	}
+	if err := s.store.SaveOAuthRequest(r.Context(), tokenHash(state), request); err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save Google login request.")
+		return
+	}
+	http.Redirect(w, r, s.google.AuthCodeURL(state, nonce, pkceChallenge(codeVerifier)), http.StatusFound)
 }
 
 func (s *Server) googleCallback(w http.ResponseWriter, r *http.Request) {
-	desktopContext, hasDesktopContext, desktopContextErr := s.readDesktopOAuthContext(r)
-	if hasDesktopContext {
-		if desktopContextErr != nil {
-			s.clearDesktopOAuthCookies(w)
-			s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "invalid_desktop_oauth_context"})
-			s.redirectFailure(w, r, "invalid_desktop_oauth_context")
-			return
-		}
-		s.googleDesktopCallback(w, r, desktopContext)
-		return
-	}
-
-	stateCookie, err := r.Cookie(s.oauthStateCookieName())
-	if err != nil || stateCookie.Value == "" {
-		s.recordLogin(r, LoginLog{AuthMethod: "google", LoginResult: "failure", FailureReason: "missing_state"})
-		s.redirectFailure(w, r, "missing_state")
-		return
-	}
-	if stateCookie.Value != r.URL.Query().Get("state") {
-		http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	request, err := s.store.ConsumeOAuthRequest(r.Context(), tokenHash(state), s.now().UTC())
+	if state == "" || errors.Is(err, ErrNotFound) {
 		s.recordLogin(r, LoginLog{AuthMethod: "google", LoginResult: "failure", FailureReason: "invalid_state"})
 		s.redirectFailure(w, r, "invalid_state")
 		return
 	}
-
+	if err != nil {
+		s.redirectFailure(w, r, "google_state_failed")
+		return
+	}
 	code := strings.TrimSpace(r.URL.Query().Get("code"))
 	if code == "" {
-		http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
 		s.recordLogin(r, LoginLog{AuthMethod: "google", LoginResult: "failure", FailureReason: "missing_code"})
 		s.redirectFailure(w, r, "missing_code")
 		return
 	}
-
-	identity, err := s.google.ExchangeCode(r.Context(), code)
+	identity, err := s.google.ExchangeCode(r.Context(), code, request.CodeVerifier, request.Nonce)
 	if err != nil {
-		http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
 		s.recordLogin(r, LoginLog{AuthMethod: "google", LoginResult: "failure", FailureReason: "exchange_failed"})
 		s.redirectFailure(w, r, "google_exchange_failed")
 		return
 	}
-
-	user, err := s.store.UpsertGoogleUser(r.Context(), identity, requestIP(r))
+	user, err := s.store.UpsertGoogleUser(r.Context(), identity, s.requestIP(r))
 	if err != nil {
-		http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
 		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "google", LoginResult: "failure", FailureReason: "user_upsert_failed"})
 		s.redirectFailure(w, r, "google_user_failed")
 		return
 	}
 	if !user.Enabled {
-		http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
 		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "google", LoginResult: "failure", FailureReason: "account_disabled"})
-		s.redirectFailure(w, r, "account_disabled")
+		if request.Kind == "desktop" {
+			s.redirectDesktopFailure(w, r, desktopOAuthContext{CallbackURL: request.CallbackURL, DesktopState: request.DesktopState}, "account_disabled")
+		} else {
+			s.redirectFailure(w, r, "account_disabled")
+		}
 		return
 	}
 
-	token, expiresAt, err := s.createSession(r, user.ID)
+	authMethod := "google"
+	if request.Kind == "desktop" {
+		authMethod = "desktop_google"
+		ticket, ticketErr := s.createDesktopSsoTicket(r, user.ID)
+		if ticketErr != nil {
+			s.redirectDesktopFailure(w, r, desktopOAuthContext{CallbackURL: request.CallbackURL, DesktopState: request.DesktopState}, "desktop_ticket_failed")
+			return
+		}
+		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: authMethod, LoginResult: "success"})
+		s.redirectDesktopSuccess(w, r, desktopOAuthContext{CallbackURL: request.CallbackURL, DesktopState: request.DesktopState}, ticket)
+		return
+	}
+
+	sessionToken, _, sessionExpiresAt, err := s.createSession(r, user.ID)
 	if err != nil {
-		http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
-		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "google", LoginResult: "failure", FailureReason: "session_create_failed"})
 		s.redirectFailure(w, r, "google_session_failed")
 		return
 	}
-
 	now := s.now().UTC()
 	_ = s.store.TouchLastLogin(r.Context(), user.ID, now)
-	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "google", LoginResult: "success"})
-
-	http.SetCookie(w, s.expiredNamedCookie(s.oauthStateCookieName()))
-	http.SetCookie(w, s.sessionCookie(token, expiresAt))
-	http.Redirect(w, r, s.successURL(), http.StatusFound)
-}
-
-func (s *Server) googleDesktopCallback(w http.ResponseWriter, r *http.Request, desktopContext desktopOAuthContext) {
-	if desktopContext.OAuthState != r.URL.Query().Get("state") {
-		s.clearDesktopOAuthCookies(w)
-		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "invalid_state"})
-		s.redirectDesktopFailure(w, r, desktopContext, "invalid_state")
-		return
-	}
-
-	code := strings.TrimSpace(r.URL.Query().Get("code"))
-	if code == "" {
-		s.clearDesktopOAuthCookies(w)
-		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "missing_code"})
-		s.redirectDesktopFailure(w, r, desktopContext, "missing_code")
-		return
-	}
-
-	identity, err := s.google.ExchangeCode(r.Context(), code)
-	if err != nil {
-		s.clearDesktopOAuthCookies(w)
-		s.recordLogin(r, LoginLog{AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "exchange_failed"})
-		s.redirectDesktopFailure(w, r, desktopContext, "google_exchange_failed")
-		return
-	}
-
-	user, err := s.store.UpsertGoogleUser(r.Context(), identity, requestIP(r))
-	if err != nil {
-		s.clearDesktopOAuthCookies(w)
-		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "user_upsert_failed"})
-		s.redirectDesktopFailure(w, r, desktopContext, "google_user_failed")
-		return
-	}
-	if !user.Enabled {
-		s.clearDesktopOAuthCookies(w)
-		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "account_disabled"})
-		s.redirectDesktopFailure(w, r, desktopContext, "account_disabled")
-		return
-	}
-
-	ticket, err := randomToken()
-	if err != nil {
-		s.clearDesktopOAuthCookies(w)
-		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "ticket_create_failed"})
-		s.redirectDesktopFailure(w, r, desktopContext, "desktop_ticket_failed")
-		return
-	}
-	expiresAt := s.now().UTC().Add(s.desktopTicketTTL)
-	if err := s.store.SaveDesktopSsoTicket(r.Context(), user.ID, tokenHash(ticket), expiresAt, requestIP(r), r.UserAgent()); err != nil {
-		s.clearDesktopOAuthCookies(w)
-		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "ticket_save_failed"})
-		s.redirectDesktopFailure(w, r, desktopContext, "desktop_ticket_failed")
-		return
-	}
-
-	s.clearDesktopOAuthCookies(w)
-	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_google", LoginResult: "success"})
-	s.redirectDesktopSuccess(w, r, desktopContext, ticket)
+	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: authMethod, LoginResult: "success"})
+	http.SetCookie(w, s.sessionCookie(sessionToken, sessionExpiresAt))
+	http.Redirect(w, r, safeRelativeRedirect(request.ReturnTo), http.StatusFound)
 }
 
 func (s *Server) desktopSsoStart(w http.ResponseWriter, r *http.Request) {
@@ -558,17 +569,19 @@ func (s *Server) desktopSsoStart(w http.ResponseWriter, r *http.Request) {
 
 	http.SetCookie(w, s.desktopSsoBridgeCookie(s.desktopSsoBridgeCallbackCookieName(), callbackURL))
 	http.SetCookie(w, s.desktopSsoBridgeCookie(s.desktopSsoBridgeStateCookieName(), desktopState))
-	http.Redirect(w, r, "/api/auth/desktop-sso/continue", http.StatusFound)
+	if _, err := s.currentUser(r); err == nil {
+		http.Redirect(w, r, "/api/auth/desktop-sso/continue", http.StatusFound)
+		return
+	}
+	loginURL, _ := url.Parse(s.authLoginURL)
+	query := loginURL.Query()
+	query.Set("return_to", "/api/auth/desktop-sso/continue")
+	query.Set("desktop", "1")
+	loginURL.RawQuery = query.Encode()
+	http.Redirect(w, r, loginURL.String(), http.StatusFound)
 }
 
 func (s *Server) desktopSsoContinue(w http.ResponseWriter, r *http.Request) {
-	if !s.isTrustedDesktopSsoBridgeRequest(r) {
-		s.clearDesktopSsoBridgeCookies(w)
-		s.recordLogin(r, LoginLog{AuthMethod: s.desktopSSOAuthMethod(), LoginResult: "failure", FailureReason: "untrusted_bridge"})
-		writeError(w, http.StatusUnauthorized, "untrusted_bridge", "Desktop SSO bridge is not trusted.")
-		return
-	}
-
 	desktopContext, ok, err := s.readDesktopSsoBridgeContext(r)
 	if !ok || err != nil {
 		s.clearDesktopSsoBridgeCookies(w)
@@ -577,8 +590,36 @@ func (s *Server) desktopSsoContinue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.isTrustedDesktopSsoBridgeRequest(r) {
+		s.clearDesktopSsoBridgeCookies(w)
+		s.completeDesktopSsoBridge(w, r, desktopContext)
+		return
+	}
+
+	user, err := s.currentUser(r)
+	if errors.Is(err, ErrNotFound) {
+		loginURL, _ := url.Parse(s.authLoginURL)
+		query := loginURL.Query()
+		query.Set("return_to", "/api/auth/desktop-sso/continue")
+		query.Set("desktop", "1")
+		loginURL.RawQuery = query.Encode()
+		http.Redirect(w, r, loginURL.String(), http.StatusFound)
+		return
+	}
+	if err != nil || !user.Enabled {
+		s.clearDesktopSsoBridgeCookies(w)
+		s.redirectDesktopFailure(w, r, desktopContext, "account_disabled")
+		return
+	}
+	ticket, err := s.createDesktopSsoTicket(r, user.ID)
+	if err != nil {
+		s.clearDesktopSsoBridgeCookies(w)
+		s.redirectDesktopFailure(w, r, desktopContext, "desktop_ticket_failed")
+		return
+	}
 	s.clearDesktopSsoBridgeCookies(w)
-	s.completeDesktopSsoBridge(w, r, desktopContext)
+	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "desktop_first_party", LoginResult: "success"})
+	s.redirectDesktopSuccess(w, r, desktopContext, ticket)
 }
 
 func (s *Server) completeDesktopSsoBridge(w http.ResponseWriter, r *http.Request, desktopContext desktopOAuthContext) {
@@ -589,7 +630,7 @@ func (s *Server) completeDesktopSsoBridge(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	user, err := s.store.UpsertAuthentikUser(r.Context(), identity, requestIP(r))
+	user, err := s.store.UpsertAuthentikUser(r.Context(), identity, s.requestIP(r))
 	if err != nil {
 		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: s.desktopSSOAuthMethod(), LoginResult: "failure", FailureReason: "user_upsert_failed"})
 		s.redirectDesktopFailure(w, r, desktopContext, "sso_user_failed")
@@ -613,6 +654,9 @@ func (s *Server) completeDesktopSsoBridge(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
+	if !s.requireValidOrigin(w, r) {
+		return
+	}
 	var req desktopSsoSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid desktop SSO request.")
@@ -645,7 +689,7 @@ func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.store.UpsertGoogleUser(r.Context(), identity, requestIP(r))
+	user, err := s.store.UpsertGoogleUser(r.Context(), identity, s.requestIP(r))
 	if err != nil {
 		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "desktop_google", LoginResult: "failure", FailureReason: "user_upsert_failed"})
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save user account.")
@@ -662,11 +706,6 @@ func (s *Server) desktopSsoSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) desktopSsoTicketSession(w http.ResponseWriter, r *http.Request, ticket string) {
 	authMethod := s.desktopSSOAuthMethod()
-	if !s.desktopJWTSigner.configured() {
-		s.recordLogin(r, LoginLog{AuthMethod: authMethod, LoginResult: "failure", FailureReason: "jwt_signer_not_configured"})
-		writeError(w, http.StatusServiceUnavailable, "sso_jwt_not_configured", "Desktop SSO JWT signer is not configured.")
-		return
-	}
 	user, err := s.store.ConsumeDesktopSsoTicket(r.Context(), tokenHash(ticket), s.now().UTC())
 	if errors.Is(err, ErrNotFound) {
 		s.recordLogin(r, LoginLog{AuthMethod: authMethod, LoginResult: "failure", FailureReason: "invalid_ticket"})
@@ -687,14 +726,7 @@ func (s *Server) desktopSsoTicketSession(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) writeDesktopSsoSessionResponse(w http.ResponseWriter, r *http.Request, user User, authMethod string) {
-	jwtToken, err := s.desktopJWTSigner.issue(user, s.now())
-	if err != nil {
-		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: authMethod, LoginResult: "failure", FailureReason: "jwt_sign_failed"})
-		writeError(w, http.StatusServiceUnavailable, "sso_jwt_not_configured", "Desktop SSO JWT signer is not configured.")
-		return
-	}
-
-	sessionToken, sessionExpiresAt, err := s.createSession(r, user.ID)
+	sessionToken, _, sessionExpiresAt, err := s.createSession(r, user.ID)
 	if err != nil {
 		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: authMethod, LoginResult: "failure", FailureReason: "session_create_failed"})
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to save session.")
@@ -708,6 +740,36 @@ func (s *Server) writeDesktopSsoSessionResponse(w http.ResponseWriter, r *http.R
 
 	http.SetCookie(w, s.sessionCookie(sessionToken, sessionExpiresAt))
 	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"user":      publicUser(user),
+		"expiresAt": sessionExpiresAt,
+	})
+}
+
+func (s *Server) desktopSsoToken(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCSRF(w, r) {
+		return
+	}
+	user, err := s.currentUser(r)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+	sessionToken, err := s.sessionToken(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
+		return
+	}
+	jwtToken, err := s.desktopJWTSigner.issue(user, s.now(), tokenHash(sessionToken))
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "sso_jwt_not_configured", "Desktop SSO JWT signer is not configured.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"user":        publicUser(user),
 		"accessToken": jwtToken.Token,
@@ -717,6 +779,21 @@ func (s *Server) writeDesktopSsoSessionResponse(w http.ResponseWriter, r *http.R
 		"audience":    jwtToken.Audiences,
 		"scope":       jwtToken.Scope,
 	})
+}
+
+func (s *Server) csrf(w http.ResponseWriter, r *http.Request) {
+	sessionToken, err := s.sessionToken(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
+		return
+	}
+	csrfToken, err := s.store.FindSessionCSRF(r.Context(), tokenHash(sessionToken), s.now().UTC())
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Session is invalid or expired.")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"csrfToken": csrfToken})
 }
 
 func (s *Server) authentikSsoSession(w http.ResponseWriter, r *http.Request) {
@@ -733,7 +810,7 @@ func (s *Server) authentikSsoSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.store.UpsertAuthentikUser(r.Context(), identity, requestIP(r))
+	user, err := s.store.UpsertAuthentikUser(r.Context(), identity, s.requestIP(r))
 	if err != nil {
 		s.recordLogin(r, LoginLog{Email: identity.Email, DisplayName: identity.Name, AuthMethod: "authentik", LoginResult: "failure", FailureReason: "user_upsert_failed"})
 		s.redirectFailure(w, r, "sso_user_failed")
@@ -745,7 +822,7 @@ func (s *Server) authentikSsoSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, expiresAt, err := s.createSession(r, user.ID)
+	token, _, expiresAt, err := s.createSession(r, user.ID)
 	if err != nil {
 		s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "authentik", LoginResult: "failure", FailureReason: "session_create_failed"})
 		s.redirectFailure(w, r, "sso_session_failed")
@@ -778,21 +855,18 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.sessionToken(r); err == nil && !s.requireCSRF(w, r) {
+		return
+	}
 	cookie, err := r.Cookie(s.cookieName)
 	if err == nil && cookie.Value != "" {
 		_ = s.store.RevokeSession(r.Context(), tokenHash(cookie.Value))
-	}
-	if token := bearerTokenFromRequest(r); token != "" {
-		_ = s.store.RevokeSession(r.Context(), tokenHash(token))
 	}
 	http.SetCookie(w, s.expiredCookie())
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) currentUser(r *http.Request) (User, error) {
-	if token := bearerTokenFromRequest(r); token != "" {
-		return s.store.FindUserBySession(r.Context(), tokenHash(token), s.now().UTC())
-	}
 	cookie, err := r.Cookie(s.cookieName)
 	if err != nil || cookie.Value == "" {
 		return User{}, ErrNotFound
@@ -848,72 +922,106 @@ func safeRelativeRedirect(value string) string {
 	return parsed.String()
 }
 
-func (s *Server) marketAdminProxy(w http.ResponseWriter, r *http.Request) {
-	if s.marketServerURL == "" || s.marketProxyToken == "" {
-		writeError(w, http.StatusServiceUnavailable, "market_not_configured", "Market admin proxy is not configured.")
+func (s *Server) marketProxy(w http.ResponseWriter, r *http.Request) {
+	if s.marketServerURL == "" || !s.desktopJWTSigner.configured() {
+		writeError(w, http.StatusServiceUnavailable, "market_not_configured", "Market proxy is not configured.")
 		return
 	}
-	user, err := s.currentUser(r)
-	if errors.Is(err, ErrNotFound) {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
-		return
-	}
-	if errors.Is(err, ErrDisabledUser) {
-		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read session.")
-		return
-	}
-	if strings.ToLower(user.Role) != "admin" {
-		writeError(w, http.StatusForbidden, "forbidden", "Admin role required.")
-		return
-	}
-
 	target, err := url.Parse(s.marketServerURL)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "market_not_configured", "Market server URL is invalid.")
 		return
 	}
+
+	var gatewayToken string
+	user, userErr := s.currentUser(r)
+	if userErr == nil {
+		if isUnsafeMethod(r.Method) && !s.requireCSRF(w, r) {
+			return
+		}
+		sessionToken, _ := s.sessionToken(r)
+		jwtToken, signErr := s.desktopJWTSigner.issueWithPolicy(
+			user,
+			s.now(),
+			tokenHash(sessionToken),
+			[]string{s.marketJWTAudience},
+			"market",
+			s.marketJWTTTL,
+		)
+		if signErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "market_not_configured", "Market proxy is not configured.")
+			return
+		}
+		gatewayToken = jwtToken.Token
+	} else if !errors.Is(userErr, ErrNotFound) {
+		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		suffix := strings.TrimPrefix(r.URL.Path, "/api/market/admin")
+		suffix := strings.TrimPrefix(r.URL.Path, "/api/market")
 		if suffix == "" {
 			suffix = "/"
 		}
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
-		req.URL.Path = singleJoiningSlash(target.Path, "/api/v1/admin"+suffix)
+		req.URL.Path = singleJoiningSlash(target.Path, "/api"+suffix)
 		req.URL.RawQuery = r.URL.RawQuery
 		req.Host = target.Host
-		req.Header.Del("X-ZenMind-User-ID")
-		req.Header.Del("X-ZenMind-User-Email")
-		req.Header.Del("X-ZenMind-User-Role")
-		req.Header.Del("X-ZenMind-Market-Proxy-Token")
-		req.Header.Set("X-ZenMind-User-ID", strconv.FormatInt(user.ID, 10))
-		req.Header.Set("X-ZenMind-User-Email", user.Email)
-		req.Header.Set("X-ZenMind-User-Role", user.Role)
-		req.Header.Set("X-ZenMind-Market-Proxy-Token", s.marketProxyToken)
+		stripIdentityHeaders(req.Header)
+		req.Header.Del("Cookie")
+		if gatewayToken != "" {
+			req.Header.Set("Authorization", "Bearer "+gatewayToken)
+		}
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
-		writeError(w, http.StatusBadGateway, "market_proxy_failed", proxyErr.Error())
+		_ = proxyErr
+		writeError(w, http.StatusBadGateway, "market_proxy_failed", "Market service is unavailable.")
 	}
 	proxy.ServeHTTP(w, r)
 }
 
-func (s *Server) createSession(r *http.Request, userID int64) (string, time.Time, error) {
+func stripIdentityHeaders(header http.Header) {
+	header.Del("Authorization")
+	header.Del("X-ZenMind-User-ID")
+	header.Del("X-ZenMind-User-Email")
+	header.Del("X-ZenMind-User-Role")
+	header.Del("X-ZenMind-Market-Proxy-Token")
+	header.Del("X-Forwarded-User")
+	header.Del("X-Forwarded-Email")
+	header.Del("X-Forwarded-Groups")
+	header.Del("X-Authentik-Username")
+	header.Del("X-Authentik-Email")
+	header.Del("X-Authentik-Name")
+	header.Del("X-Authentik-Uid")
+}
+
+func isUnsafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) createSession(r *http.Request, userID int64) (string, string, time.Time, error) {
 	token, err := randomToken()
 	if err != nil {
-		return "", time.Time{}, err
+		return "", "", time.Time{}, err
+	}
+	csrfToken, err := randomToken()
+	if err != nil {
+		return "", "", time.Time{}, err
 	}
 	expiresAt := s.now().UTC().Add(s.sessionTTL)
-	if err := s.store.CreateSession(r.Context(), userID, tokenHash(token), expiresAt, r.UserAgent(), requestIP(r)); err != nil {
-		return "", time.Time{}, err
+	if err := s.store.CreateSession(r.Context(), userID, tokenHash(token), csrfToken, expiresAt, r.UserAgent(), s.requestIP(r)); err != nil {
+		return "", "", time.Time{}, err
 	}
-	return token, expiresAt, nil
+	return token, csrfToken, expiresAt, nil
 }
 
 func (s *Server) createDesktopSsoTicket(r *http.Request, userID int64) (string, error) {
@@ -922,7 +1030,7 @@ func (s *Server) createDesktopSsoTicket(r *http.Request, userID int64) (string, 
 		return "", err
 	}
 	expiresAt := s.now().UTC().Add(s.desktopTicketTTL)
-	if err := s.store.SaveDesktopSsoTicket(r.Context(), userID, tokenHash(ticket), expiresAt, requestIP(r), r.UserAgent()); err != nil {
+	if err := s.store.SaveDesktopSsoTicket(r.Context(), userID, tokenHash(ticket), expiresAt, s.requestIP(r), r.UserAgent()); err != nil {
 		return "", err
 	}
 	return ticket, nil
@@ -931,7 +1039,7 @@ func (s *Server) createDesktopSsoTicket(r *http.Request, userID int64) (string, 
 func normalizeDesktopSSOProvider(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
-		return "authentik"
+		return "first_party"
 	}
 	value = strings.Map(func(ch rune) rune {
 		if ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '-' {
@@ -940,7 +1048,7 @@ func normalizeDesktopSSOProvider(value string) string {
 		return -1
 	}, value)
 	if value == "" {
-		return "authentik"
+		return "first_party"
 	}
 	return value
 }
@@ -1192,21 +1300,17 @@ func (s *Server) redirectFailure(w http.ResponseWriter, r *http.Request, reason 
 }
 
 func (s *Server) recordLogin(r *http.Request, entry LoginLog) {
-	entry.IP = requestIP(r)
+	entry.IP = s.requestIP(r)
 	entry.UserAgent = r.UserAgent()
 	entry.LoginAt = s.now().UTC()
 	_ = s.store.RecordLogin(r.Context(), entry)
-}
-
-func requestIP(r *http.Request) string {
-	return clientIPFromRequest(r)
 }
 
 func downloadEventFromRequest(r *http.Request, installerKey, version string, downloadedAt time.Time) DownloadEvent {
 	return DownloadEvent{
 		InstallerKey:   installerKey,
 		Version:        version,
-		ClientIP:       clientIPFromRequest(r),
+		ClientIP:       validRemoteIP(r.RemoteAddr),
 		RemoteAddr:     strings.TrimSpace(r.RemoteAddr),
 		XForwardedFor:  strings.TrimSpace(r.Header.Get("X-Forwarded-For")),
 		XRealIP:        strings.TrimSpace(r.Header.Get("X-Real-IP")),
@@ -1215,16 +1319,6 @@ func downloadEventFromRequest(r *http.Request, installerKey, version string, dow
 		AcceptLanguage: strings.TrimSpace(r.Header.Get("Accept-Language")),
 		DownloadedAt:   downloadedAt,
 	}
-}
-
-func clientIPFromRequest(r *http.Request) string {
-	if ip := firstValidForwardedIP(r.Header.Get("X-Forwarded-For")); ip != "" {
-		return ip
-	}
-	if ip := validHeaderIP(r.Header.Get("X-Real-IP")); ip != "" {
-		return ip
-	}
-	return validRemoteIP(r.RemoteAddr)
 }
 
 func firstValidForwardedIP(value string) string {
@@ -1246,18 +1340,6 @@ func validHeaderIP(value string) string {
 		return ""
 	}
 	return addr.String()
-}
-
-func validRemoteIP(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	host, _, err := net.SplitHostPort(value)
-	if err == nil {
-		value = host
-	}
-	return validHeaderIP(value)
 }
 
 func randomToken() (string, error) {
@@ -1290,6 +1372,11 @@ func randomDigits(length int) (string, error) {
 func tokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+func pkceChallenge(codeVerifier string) string {
+	sum := sha256.Sum256([]byte(codeVerifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func emailCodeHash(email, code string) string {

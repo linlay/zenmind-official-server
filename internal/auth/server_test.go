@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -74,6 +75,7 @@ func TestLoginMeAndLogout(t *testing.T) {
 
 	logoutReq := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
 	logoutReq.AddCookie(cookies[0])
+	logoutReq.Header.Set("X-CSRF-Token", csrfTokenForCookie(t, handler, cookies[0]))
 	logoutRec := httptest.NewRecorder()
 	handler.ServeHTTP(logoutRec, logoutReq)
 	if logoutRec.Code != http.StatusOK {
@@ -175,6 +177,36 @@ func TestEmailCodeRejectsInvalidEmail(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestVerifiedEmailLinksGoogleAndEmailCodeIdentity(t *testing.T) {
+	store := newMemoryStore()
+	emailUser, err := store.UpsertEmailCodeUser(context.Background(), "same@example.com", "")
+	if err != nil {
+		t.Fatalf("upsert email user: %v", err)
+	}
+	googleUser, err := store.UpsertGoogleUser(context.Background(), GoogleIdentity{
+		Subject:       "google-same-subject",
+		Email:         "Same@Example.com",
+		EmailVerified: true,
+		Name:          "Same User",
+	}, "")
+	if err != nil {
+		t.Fatalf("upsert google user: %v", err)
+	}
+	if googleUser.ID != emailUser.ID || len(store.users) != 1 {
+		t.Fatalf("verified identities were not linked: email=%#v google=%#v users=%#v", emailUser, googleUser, store.users)
+	}
+}
+
+func TestGoogleIdentityRejectsUnverifiedEmail(t *testing.T) {
+	store := newMemoryStore()
+	if _, err := store.UpsertGoogleUser(context.Background(), GoogleIdentity{
+		Subject: "unverified-subject",
+		Email:   "unverified@example.com",
+	}, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unverified Google identity error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -294,7 +326,8 @@ func TestRequestIPParsesRealClientIP(t *testing.T) {
 			if tt.xRealIP != "" {
 				req.Header.Set("X-Real-IP", tt.xRealIP)
 			}
-			if got := requestIP(req); got != tt.want {
+			server := NewServer(newMemoryStore(), ServerOptions{TrustedProxyCIDRs: []string{"192.0.2.0/24"}})
+			if got := server.requestIP(req); got != tt.want {
 				t.Fatalf("requestIP() = %q, want %q", got, tt.want)
 			}
 		})
@@ -368,10 +401,10 @@ func TestInstallersReturnsServiceUnavailableWhenCatalogFails(t *testing.T) {
 	}
 }
 
-func TestGoogleStartRedirectsAndSetsStateCookie(t *testing.T) {
-	handler, _ := testHandler(t)
+func TestGoogleStartRedirectsWithServerSideStateAndPKCE(t *testing.T) {
+	handler, store := testHandler(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/auth/google/start", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/google/start?return_to=%2Fprofile", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -386,18 +419,19 @@ func TestGoogleStartRedirectsAndSetsStateCookie(t *testing.T) {
 	if parsed.Scheme != "https" || parsed.Host != "accounts.example.test" || parsed.Path != "/auth" {
 		t.Fatalf("unexpected location %q", location)
 	}
-	var stateCookie *http.Cookie
-	for _, cookie := range rec.Result().Cookies() {
-		if cookie.Name == "test_session_oauth_state" {
-			stateCookie = cookie
-			break
-		}
+	state := parsed.Query().Get("state")
+	if state == "" || parsed.Query().Get("nonce") == "" || parsed.Query().Get("code_challenge") == "" {
+		t.Fatalf("missing state, nonce, or PKCE challenge in %q", location)
 	}
-	if stateCookie == nil || stateCookie.Value == "" || !stateCookie.HttpOnly {
-		t.Fatalf("missing oauth state cookie: %#v", rec.Result().Cookies())
+	if parsed.Query().Get("code_challenge_method") != "" {
+		t.Fatalf("fake provider should encode the PKCE challenge supplied by the server")
 	}
-	if parsed.Query().Get("state") != stateCookie.Value {
-		t.Fatalf("redirect state and cookie state differ")
+	record, ok := store.oauth[tokenHash(state)]
+	if !ok || record.request.ReturnTo != "/profile" || record.request.Nonce == "" || record.request.CodeVerifier == "" {
+		t.Fatalf("unexpected server-side OAuth request: %#v", record)
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("OAuth state must not be stored in a browser cookie: %#v", rec.Result().Cookies())
 	}
 }
 
@@ -420,15 +454,18 @@ func TestGoogleCallbackRejectsStateMismatch(t *testing.T) {
 func TestGoogleCallbackCreatesSession(t *testing.T) {
 	handler, store := testHandler(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/auth/google/callback?state=expected&code=test-code", nil)
-	req.AddCookie(&http.Cookie{Name: "test_session_oauth_state", Value: "expected"})
+	startReq := httptest.NewRequest(http.MethodGet, "/api/auth/google/start?return_to=%2Fprofile", nil)
+	startRec := httptest.NewRecorder()
+	handler.ServeHTTP(startRec, startReq)
+	state := googleStateFromRedirect(t, startRec)
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/google/callback?state="+url.QueryEscape(state)+"&code=test-code", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusFound {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if rec.Header().Get("Location") != "http://localhost:5173/login" {
+	if rec.Header().Get("Location") != "/profile" {
 		t.Fatalf("unexpected success redirect %q", rec.Header().Get("Location"))
 	}
 
@@ -608,7 +645,7 @@ func TestAuthentikSSOSessionRejectsExternalRedirect(t *testing.T) {
 	}
 }
 
-func TestDesktopSSOStartRedirectsToContinueAndSetsBridgeCookies(t *testing.T) {
+func TestDesktopSSOStartRedirectsToFirstPartyLoginAndSetsContextCookies(t *testing.T) {
 	handler, _ := testHandler(t)
 	callbackURL := "http://localhost:43123/api/auth/oidc/callback"
 
@@ -619,7 +656,7 @@ func TestDesktopSSOStartRedirectsToContinueAndSetsBridgeCookies(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if rec.Header().Get("Location") != "/api/auth/desktop-sso/continue" {
+	if rec.Header().Get("Location") != "/login?desktop=1&return_to=%2Fapi%2Fauth%2Fdesktop-sso%2Fcontinue" {
 		t.Fatalf("unexpected continue redirect: %q", rec.Header().Get("Location"))
 	}
 	cookies := cookiesByName(rec.Result().Cookies())
@@ -645,7 +682,7 @@ func TestDesktopSSOStartRejectsMissingState(t *testing.T) {
 	}
 }
 
-func TestDesktopSSOContinueRejectsUntrustedBridge(t *testing.T) {
+func TestDesktopSSOContinueRedirectsUnauthenticatedUserToLogin(t *testing.T) {
 	handler, _ := testHandler(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/desktop-sso/continue", nil)
@@ -654,8 +691,11 @@ func TestDesktopSSOContinueRejectsUntrustedBridge(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
+	if rec.Code != http.StatusFound {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Location") != "/login?desktop=1&return_to=%2Fapi%2Fauth%2Fdesktop-sso%2Fcontinue" {
+		t.Fatalf("unexpected login redirect: %q", rec.Header().Get("Location"))
 	}
 }
 
@@ -760,9 +800,28 @@ func TestDesktopSSOStartCreatesTicketAndBearerSession(t *testing.T) {
 	if err := json.NewDecoder(exchangeRec.Body).Decode(&exchangeBody); err != nil {
 		t.Fatalf("decode exchange: %v", err)
 	}
-	accessToken, _ := exchangeBody["accessToken"].(string)
-	if accessToken == "" || exchangeBody["tokenType"] != "Bearer" {
-		t.Fatalf("unexpected token exchange body: %#v", exchangeBody)
+	if _, exists := exchangeBody["accessToken"]; exists {
+		t.Fatalf("ticket exchange must only establish a cookie session: %#v", exchangeBody)
+	}
+	cookies := exchangeRec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "test_session" || !cookies[0].HttpOnly {
+		t.Fatalf("unexpected desktop SSO cookies: %#v", cookies)
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/token", bytes.NewBufferString(`{}`))
+	tokenReq.AddCookie(cookies[0])
+	tokenReq.Header.Set("X-CSRF-Token", csrfTokenForCookie(t, handler, cookies[0]))
+	tokenRec := httptest.NewRecorder()
+	handler.ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %s", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenBody map[string]any
+	if err := json.NewDecoder(tokenRec.Body).Decode(&tokenBody); err != nil {
+		t.Fatalf("decode token response: %v", err)
+	}
+	accessToken, _ := tokenBody["accessToken"].(string)
+	if accessToken == "" || tokenBody["tokenType"] != "Bearer" {
+		t.Fatalf("unexpected token response: %#v", tokenBody)
 	}
 	claims := decodeTestJWTClaims(t, accessToken)
 	if claims["iss"] != "https://official.example.test" || claims["sub"] != "user:2" || claims["email"] != "desktop.user@example.com" || claims["role"] != "user" {
@@ -772,15 +831,11 @@ func TestDesktopSSOStartCreatesTicketAndBearerSession(t *testing.T) {
 		t.Fatalf("unexpected JWT identity claims: %#v", claims)
 	}
 	audiences, _ := claims["aud"].([]any)
-	if len(audiences) != 2 || audiences[0] != "zenmind-market-server" || audiences[1] != "zenmind-tunnel-hub-server" {
+	if len(audiences) != 4 || audiences[0] != "market" || audiences[1] != "tunnel" || audiences[2] != "kanban" || audiences[3] != "zenmind-im-server" {
 		t.Fatalf("unexpected JWT audience: %#v", claims["aud"])
 	}
-	if int64(claims["exp"].(float64)-claims["iat"].(float64)) != int64(24*time.Hour/time.Second) {
+	if int64(claims["exp"].(float64)-claims["iat"].(float64)) != int64(12*time.Hour/time.Second) {
 		t.Fatalf("unexpected JWT ttl: %#v", claims)
-	}
-	cookies := exchangeRec.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != "test_session" || !cookies[0].HttpOnly {
-		t.Fatalf("unexpected desktop SSO cookies: %#v", cookies)
 	}
 
 	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
@@ -811,8 +866,8 @@ func TestGoogleDesktopStartRejectsNonLoopbackCallback(t *testing.T) {
 	}
 }
 
-func TestGoogleDesktopStartRedirectsAndSetsDesktopCookies(t *testing.T) {
-	handler, _ := testHandler(t)
+func TestGoogleDesktopStartStoresServerSideContext(t *testing.T) {
+	handler, store := testHandler(t)
 
 	callbackURL := "http://127.0.0.1:43123/api/auth/oidc/callback"
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/google/desktop/start?callback="+url.QueryEscape(callbackURL)+"&state=desktop-state", nil)
@@ -830,19 +885,13 @@ func TestGoogleDesktopStartRedirectsAndSetsDesktopCookies(t *testing.T) {
 		t.Fatalf("unexpected location %q", rec.Header().Get("Location"))
 	}
 
-	cookies := cookiesByName(rec.Result().Cookies())
-	oauthState := cookies["test_session_desktop_oauth_state"]
-	if oauthState == nil || oauthState.Value == "" || !oauthState.HttpOnly {
-		t.Fatalf("missing desktop oauth state cookie: %#v", rec.Result().Cookies())
+	state := parsed.Query().Get("state")
+	record, ok := store.oauth[tokenHash(state)]
+	if !ok || record.request.Kind != "desktop" || record.request.CallbackURL != callbackURL || record.request.DesktopState != "desktop-state" {
+		t.Fatalf("unexpected desktop OAuth request: %#v", record)
 	}
-	if parsed.Query().Get("state") != oauthState.Value {
-		t.Fatalf("redirect state and cookie state differ")
-	}
-	if callback := cookies["test_session_desktop_oauth_callback"]; callback == nil || callback.Value != callbackURL || !callback.HttpOnly {
-		t.Fatalf("unexpected callback cookie: %#v", callback)
-	}
-	if desktopState := cookies["test_session_desktop_state"]; desktopState == nil || desktopState.Value != "desktop-state" || !desktopState.HttpOnly {
-		t.Fatalf("unexpected desktop state cookie: %#v", desktopState)
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("desktop OAuth context must be server-side: %#v", rec.Result().Cookies())
 	}
 }
 
@@ -903,7 +952,7 @@ func TestDesktopSSOSessionCreatesSessionFromTicket(t *testing.T) {
 	}
 }
 
-func TestDesktopSSOSessionRejectsMissingJWTSigner(t *testing.T) {
+func TestDesktopTokenRejectsMissingJWTSigner(t *testing.T) {
 	handler, store := testHandlerWithoutDesktopJWT(t)
 	user, err := store.UpsertAuthentikUser(context.Background(), AuthentikIdentity{
 		Subject: "missing-jwt-subject",
@@ -921,11 +970,20 @@ func TestDesktopSSOSessionRejectsMissingJWTSigner(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"ticket":"`+ticket+`"}`))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if len(rec.Result().Cookies()) != 0 {
-		t.Fatalf("missing JWT signer should not set cookies: %#v", rec.Result().Cookies())
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("ticket exchange should establish a session before token issuance: %#v", cookies)
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/token", bytes.NewBufferString(`{}`))
+	tokenReq.AddCookie(cookies[0])
+	tokenReq.Header.Set("X-CSRF-Token", csrfTokenForCookie(t, handler, cookies[0]))
+	tokenRec := httptest.NewRecorder()
+	handler.ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("token status = %d body = %s", tokenRec.Code, tokenRec.Body.String())
 	}
 }
 
@@ -951,9 +1009,10 @@ func TestDesktopSSOTicketCanOnlyBeConsumedOnce(t *testing.T) {
 func TestDesktopSSOSessionRejectsExpiredTicket(t *testing.T) {
 	handler, store := testHandler(t)
 	user, err := store.UpsertGoogleUser(context.Background(), GoogleIdentity{
-		Subject: "expired-desktop-subject",
-		Email:   "expired@example.com",
-		Name:    "Expired User",
+		Subject:       "expired-desktop-subject",
+		Email:         "expired@example.com",
+		EmailVerified: true,
+		Name:          "Expired User",
 	}, "")
 	if err != nil {
 		t.Fatalf("upsert user: %v", err)
@@ -974,9 +1033,10 @@ func TestDesktopSSOSessionRejectsExpiredTicket(t *testing.T) {
 func TestGoogleDesktopCallbackDoesNotIssueTicketForDisabledUser(t *testing.T) {
 	handler, store := testHandler(t)
 	if _, err := store.UpsertGoogleUser(context.Background(), GoogleIdentity{
-		Subject: "google-subject",
-		Email:   "google-user@example.com",
-		Name:    "Google User",
+		Subject:       "google-subject",
+		Email:         "google-user@example.com",
+		EmailVerified: true,
+		Name:          "Google User",
 	}, ""); err != nil {
 		t.Fatalf("upsert user: %v", err)
 	}
@@ -1027,9 +1087,8 @@ func TestDesktopSSOSessionCreatesSessionFromGoogleIDToken(t *testing.T) {
 	}
 
 	var body struct {
-		OK          bool           `json:"ok"`
-		User        map[string]any `json:"user"`
-		AccessToken string         `json:"accessToken"`
+		OK   bool           `json:"ok"`
+		User map[string]any `json:"user"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode desktop SSO response: %v", err)
@@ -1037,7 +1096,21 @@ func TestDesktopSSOSessionCreatesSessionFromGoogleIDToken(t *testing.T) {
 	if !body.OK || body.User["email"] != "desktop-user@example.com" {
 		t.Fatalf("unexpected desktop SSO response: %#v", body)
 	}
-	if claims := decodeTestJWTClaims(t, body.AccessToken); claims["auth_provider"] != "google" || claims["email"] != "desktop-user@example.com" {
+	tokenReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/token", bytes.NewBufferString(`{}`))
+	tokenReq.AddCookie(cookies[0])
+	tokenReq.Header.Set("X-CSRF-Token", csrfTokenForCookie(t, handler, cookies[0]))
+	tokenRec := httptest.NewRecorder()
+	handler.ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %s", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenBody struct {
+		AccessToken string `json:"accessToken"`
+	}
+	if err := json.NewDecoder(tokenRec.Body).Decode(&tokenBody); err != nil {
+		t.Fatalf("decode token response: %v", err)
+	}
+	if claims := decodeTestJWTClaims(t, tokenBody.AccessToken); claims["auth_provider"] != "google" || claims["email"] != "desktop-user@example.com" {
 		t.Fatalf("unexpected google desktop JWT claims: %#v", claims)
 	}
 
@@ -1068,6 +1141,82 @@ func TestDesktopSSOSessionRejectsInvalidGoogleIDToken(t *testing.T) {
 	}
 }
 
+func TestDesktopTokenRequiresCSRF(t *testing.T) {
+	handler, _ := testHandler(t)
+	ticket := createDesktopTicketFromGoogleLogin(t, handler)
+	exchangeReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/session", bytes.NewBufferString(`{"ticket":"`+ticket+`"}`))
+	exchangeRec := httptest.NewRecorder()
+	handler.ServeHTTP(exchangeRec, exchangeReq)
+	cookie := exchangeRec.Result().Cookies()[0]
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/token", bytes.NewBufferString(`{}`))
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMarketProxyStripsSpoofedIdentityAndInjectsShortJWT(t *testing.T) {
+	var received http.Header
+	var receivedPath string
+	market := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received = r.Header.Clone()
+		receivedPath = r.URL.RequestURI()
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	}))
+	defer market.Close()
+
+	store := newMemoryStore()
+	if err := EnsureInitialAdmin(context.Background(), store, "admin@zenmind.cc", "correct-password"); err != nil {
+		t.Fatalf("init admin: %v", err)
+	}
+	server := NewServer(store, ServerOptions{
+		CookieName:        "test_session",
+		SessionTTL:        time.Hour,
+		DesktopJWT:        testDesktopJWTConfig(t),
+		MarketServerURL:   market.URL,
+		MarketJWTAudience: "market",
+		MarketJWTTTL:      90 * time.Second,
+	})
+	handler := server.Routes()
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"email":"admin@zenmind.cc","password":"correct-password"}`))
+	loginRec := httptest.NewRecorder()
+	handler.ServeHTTP(loginRec, loginReq)
+	cookie := loginRec.Result().Cookies()[0]
+
+	req := httptest.NewRequest(http.MethodGet, "/api/market/v1/catalog?kind=skill", nil)
+	req.AddCookie(cookie)
+	req.Header.Set("Authorization", "Bearer attacker")
+	req.Header.Set("X-ZenMind-User-ID", "999")
+	req.Header.Set("X-Forwarded-User", "attacker")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if receivedPath != "/api/v1/catalog?kind=skill" {
+		t.Fatalf("market path = %q", receivedPath)
+	}
+	if received.Get("X-ZenMind-User-ID") != "" || received.Get("X-Forwarded-User") != "" || received.Get("Cookie") != "" {
+		t.Fatalf("spoofed identity reached Market: %#v", received)
+	}
+	authorization := received.Get("Authorization")
+	if !strings.HasPrefix(authorization, "Bearer ") {
+		t.Fatalf("missing gateway JWT: %#v", received)
+	}
+	claims := decodeTestJWTClaims(t, strings.TrimPrefix(authorization, "Bearer "))
+	audiences, _ := claims["aud"].([]any)
+	if len(audiences) != 1 || audiences[0] != "market" || claims["scope"] != "market" {
+		t.Fatalf("unexpected gateway claims: %#v", claims)
+	}
+	if int64(claims["exp"].(float64)-claims["iat"].(float64)) != 90 {
+		t.Fatalf("unexpected gateway ttl: %#v", claims)
+	}
+}
+
 func testHandler(t *testing.T) (http.Handler, *memoryStore) {
 	t.Helper()
 	return testHandlerWithDesktopJWT(t, true)
@@ -1086,12 +1235,14 @@ func testHandlerWithDesktopJWT(t *testing.T, includeDesktopJWT bool) (http.Handl
 		t.Fatalf("init admin: %v", err)
 	}
 	options := ServerOptions{
-		CookieName:     "test_session",
-		SessionTTL:     time.Hour,
-		Google:         fakeGoogleProvider{},
-		AuthSuccessURL: "http://localhost:5173/login",
-		AuthFailureURL: "http://localhost:5173/login",
-		SSOBridgeToken: "test-sso-bridge-token",
+		CookieName:        "test_session",
+		SessionTTL:        time.Hour,
+		TrustedProxyCIDRs: []string{"192.0.2.0/24"},
+		Google:            fakeGoogleProvider{},
+		AuthLoginURL:      "/login",
+		AuthSuccessURL:    "http://localhost:5173/login",
+		AuthFailureURL:    "http://localhost:5173/login",
+		SSOBridgeToken:    "test-sso-bridge-token",
 	}
 	if includeDesktopJWT {
 		options.DesktopJWT = testDesktopJWTConfig(t)
@@ -1109,14 +1260,16 @@ func testHandlerWithMailer(t *testing.T) (http.Handler, *memoryStore, *fakeMaile
 	}
 	mailer := &fakeMailer{}
 	server := NewServer(store, ServerOptions{
-		CookieName:     "test_session",
-		SessionTTL:     time.Hour,
-		Google:         fakeGoogleProvider{},
-		AuthSuccessURL: "http://localhost:5173/login",
-		AuthFailureURL: "http://localhost:5173/login",
-		SSOBridgeToken: "test-sso-bridge-token",
-		DesktopJWT:     testDesktopJWTConfig(t),
-		Mailer:         mailer,
+		CookieName:        "test_session",
+		SessionTTL:        time.Hour,
+		TrustedProxyCIDRs: []string{"192.0.2.0/24"},
+		Google:            fakeGoogleProvider{},
+		AuthLoginURL:      "/login",
+		AuthSuccessURL:    "http://localhost:5173/login",
+		AuthFailureURL:    "http://localhost:5173/login",
+		SSOBridgeToken:    "test-sso-bridge-token",
+		DesktopJWT:        testDesktopJWTConfig(t),
+		Mailer:            mailer,
 	})
 	return server.Routes(), store, mailer
 }
@@ -1133,9 +1286,9 @@ func testDesktopJWTConfig(t *testing.T) DesktopJWTConfig {
 			Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
 		})),
 		Issuer:    "https://official.example.test",
-		Audiences: []string{"zenmind-market-server", "zenmind-tunnel-hub-server"},
+		Audiences: []string{"market", "tunnel", "kanban", "zenmind-im-server"},
 		KeyID:     "test-key",
-		TTL:       24 * time.Hour,
+		TTL:       12 * time.Hour,
 	}
 }
 
@@ -1165,6 +1318,27 @@ func decodeTestJWTClaims(t *testing.T, token string) map[string]any {
 		t.Fatalf("parse JWT claims: %v", err)
 	}
 	return claims
+}
+
+func csrfTokenForCookie(t *testing.T, handler http.Handler, cookie *http.Cookie) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/csrf", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("csrf status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode csrf response: %v", err)
+	}
+	if body.CSRFToken == "" {
+		t.Fatal("csrf response did not include a token")
+	}
+	return body.CSRFToken
 }
 
 func cookiesByName(cookies []*http.Cookie) map[string]*http.Cookie {
@@ -1246,16 +1420,22 @@ func (fakeGoogleProvider) Configured() bool {
 	return true
 }
 
-func (fakeGoogleProvider) AuthCodeURL(state string) string {
-	return "https://accounts.example.test/auth?state=" + state
+func (fakeGoogleProvider) AuthCodeURL(state, nonce, codeChallenge string) string {
+	values := url.Values{
+		"state":          {state},
+		"nonce":          {nonce},
+		"code_challenge": {codeChallenge},
+	}
+	return "https://accounts.example.test/auth?" + values.Encode()
 }
 
-func (fakeGoogleProvider) ExchangeCode(context.Context, string) (GoogleIdentity, error) {
+func (fakeGoogleProvider) ExchangeCode(context.Context, string, string, string) (GoogleIdentity, error) {
 	return GoogleIdentity{
-		Subject: "google-subject",
-		Email:   "google-user@example.com",
-		Name:    "Google User",
-		Picture: "https://example.com/avatar.png",
+		Subject:       "google-subject",
+		Email:         "google-user@example.com",
+		EmailVerified: true,
+		Name:          "Google User",
+		Picture:       "https://example.com/avatar.png",
 	}, nil
 }
 
@@ -1264,10 +1444,11 @@ func (fakeGoogleProvider) VerifyIDToken(_ context.Context, rawToken string) (Goo
 		return GoogleIdentity{}, context.Canceled
 	}
 	return GoogleIdentity{
-		Subject: "desktop-google-subject",
-		Email:   "desktop-user@example.com",
-		Name:    "Desktop User",
-		Picture: "https://example.com/desktop-avatar.png",
+		Subject:       "desktop-google-subject",
+		Email:         "desktop-user@example.com",
+		EmailVerified: true,
+		Name:          "Desktop User",
+		Picture:       "https://example.com/desktop-avatar.png",
 	}, nil
 }
 

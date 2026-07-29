@@ -22,6 +22,7 @@ type Config struct {
 	CookieName           string
 	CookieSecure         bool
 	SessionTTL           time.Duration
+	TrustedProxyCIDRs    []string
 	GoogleClientID       string
 	GoogleDesktopID      string
 	GoogleSecret         string
@@ -35,6 +36,9 @@ type Config struct {
 	SSOJWTAudiences      []string
 	SSOJWTKeyID          string
 	SSOJWTTTL            time.Duration
+	MarketJWTAudience    string
+	MarketJWTTTL         time.Duration
+	AuthLoginURL         string
 	AuthSuccessURL       string
 	AuthFailureURL       string
 	SMTPHost             string
@@ -51,21 +55,25 @@ func FromEnv() (Config, error) {
 	cfg := Config{
 		Addr:                 env("APP_ADDR", ":8080"),
 		CookieName:           env("COOKIE_NAME", "zenmind_session"),
-		CookieSecure:         envBool("COOKIE_SECURE", false),
+		CookieSecure:         envBool("COOKIE_SECURE", true),
 		SessionTTL:           envDuration("SESSION_TTL", 24*time.Hour),
+		TrustedProxyCIDRs:    csvEnv("TRUSTED_PROXY_CIDRS", "172.20.0.0/16"),
 		GoogleClientID:       os.Getenv("GOOGLE_CLIENT_ID"),
 		GoogleDesktopID:      os.Getenv("GOOGLE_DESKTOP_CLIENT_ID"),
 		GoogleSecret:         os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleRedirectURL:    os.Getenv("GOOGLE_REDIRECT_URL"),
 		SSOBridgeToken:       os.Getenv("SSO_BRIDGE_TOKEN"),
-		DesktopSSOProvider:   env("DESKTOP_SSO_PROVIDER", "authentik"),
+		DesktopSSOProvider:   env("DESKTOP_SSO_PROVIDER", "first_party"),
 		DesktopSSOTicketTTL:  envDuration("DESKTOP_SSO_TICKET_TTL", 2*time.Minute),
 		SSOJWTPrivateKeyFile: strings.TrimSpace(os.Getenv("SSO_JWT_PRIVATE_KEY_FILE")),
 		SSOJWTPrivateKeyPEM:  strings.TrimSpace(os.Getenv("SSO_JWT_PRIVATE_KEY_PEM")),
 		SSOJWTIssuer:         strings.TrimSpace(os.Getenv("SSO_JWT_ISSUER")),
-		SSOJWTAudiences:      csvEnv("SSO_JWT_AUDIENCES", "zenmind-market-server,zenmind-tunnel-hub-server"),
+		SSOJWTAudiences:      csvEnv("SSO_JWT_AUDIENCES", "market,tunnel,kanban,zenmind-im-server"),
 		SSOJWTKeyID:          env("SSO_JWT_KEY_ID", "default"),
-		SSOJWTTTL:            envDuration("SSO_JWT_TTL", 24*time.Hour),
+		SSOJWTTTL:            envDuration("SSO_JWT_TTL", 12*time.Hour),
+		MarketJWTAudience:    env("MARKET_JWT_AUDIENCE", "market"),
+		MarketJWTTTL:         envDuration("MARKET_JWT_TTL", 90*time.Second),
+		AuthLoginURL:         env("AUTH_LOGIN_URL", "/login"),
 		AuthSuccessURL:       env("AUTH_SUCCESS_URL", "http://localhost:5173/login"),
 		AuthFailureURL:       env("AUTH_FAILURE_URL", "http://localhost:5173/login"),
 		SMTPHost:             env("SMTP_HOST", "smtp.gmail.com"),

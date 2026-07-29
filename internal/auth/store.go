@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 var (
@@ -56,6 +56,16 @@ type EmailCodeChallenge struct {
 	ExpiresAt time.Time
 }
 
+type OAuthRequest struct {
+	Kind         string
+	Nonce        string
+	CodeVerifier string
+	ReturnTo     string
+	CallbackURL  string
+	DesktopState string
+	ExpiresAt    time.Time
+}
+
 type DownloadStat struct {
 	InstallerKey string `json:"installerKey"`
 	Total        int64  `json:"total"`
@@ -85,7 +95,10 @@ type Store interface {
 	UpsertEmailCodeUser(ctx context.Context, email, ip string) (User, error)
 	SaveEmailCode(ctx context.Context, email, codeHash string, expiresAt time.Time) error
 	ConsumeEmailCode(ctx context.Context, email, codeHash string, now time.Time) error
-	CreateSession(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time, userAgent, ip string) error
+	SaveOAuthRequest(ctx context.Context, stateHash string, request OAuthRequest) error
+	ConsumeOAuthRequest(ctx context.Context, stateHash string, now time.Time) (OAuthRequest, error)
+	CreateSession(ctx context.Context, userID int64, tokenHash, csrfToken string, expiresAt time.Time, userAgent, ip string) error
+	FindSessionCSRF(ctx context.Context, tokenHash string, now time.Time) (string, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
 	SaveDesktopSsoTicket(ctx context.Context, userID int64, ticketHash string, expiresAt time.Time, ip, userAgent string) error
 	ConsumeDesktopSsoTicket(ctx context.Context, ticketHash string, now time.Time) (User, error)
@@ -142,10 +155,26 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 			PRIMARY KEY (USER_ID_),
 			CONSTRAINT FK_AUTH_LOCAL_CREDENTIAL_USER FOREIGN KEY (USER_ID_) REFERENCES auth_user (ID_) ON DELETE CASCADE
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS auth_identity (
+			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			USER_ID_ BIGINT UNSIGNED NOT NULL,
+			PROVIDER_ VARCHAR(32) NOT NULL,
+			SUBJECT_ VARCHAR(255) NOT NULL,
+			EMAIL_ VARCHAR(255) NOT NULL DEFAULT '',
+			EMAIL_VERIFIED_ TINYINT(1) NOT NULL DEFAULT 0,
+			CREATED_AT_ DATETIME(3) NOT NULL,
+			UPDATED_AT_ DATETIME(3) NOT NULL,
+			PRIMARY KEY (ID_),
+			UNIQUE KEY UK_AUTH_IDENTITY_PROVIDER_SUBJECT (PROVIDER_, SUBJECT_),
+			KEY IDX_AUTH_IDENTITY_USER (USER_ID_),
+			KEY IDX_AUTH_IDENTITY_EMAIL (EMAIL_),
+			CONSTRAINT FK_AUTH_IDENTITY_USER FOREIGN KEY (USER_ID_) REFERENCES auth_user (ID_) ON DELETE CASCADE
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS auth_session (
 			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 			USER_ID_ BIGINT UNSIGNED NOT NULL,
 			TOKEN_HASH_ CHAR(64) NOT NULL,
+			CSRF_TOKEN_ VARCHAR(64) NOT NULL DEFAULT '',
 			EXPIRES_AT_ DATETIME(3) NOT NULL,
 			CREATED_AT_ DATETIME(3) NOT NULL,
 			LAST_SEEN_AT_ DATETIME(3) NOT NULL,
@@ -155,6 +184,22 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 			UNIQUE KEY UK_AUTH_SESSION_TOKEN_HASH (TOKEN_HASH_),
 			KEY IDX_AUTH_SESSION_USER_EXPIRES (USER_ID_, EXPIRES_AT_),
 			CONSTRAINT FK_AUTH_SESSION_USER FOREIGN KEY (USER_ID_) REFERENCES auth_user (ID_) ON DELETE CASCADE
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS auth_oauth_request (
+			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			STATE_HASH_ CHAR(64) NOT NULL,
+			KIND_ VARCHAR(32) NOT NULL DEFAULT 'web',
+			NONCE_ VARCHAR(128) NOT NULL,
+			CODE_VERIFIER_ VARCHAR(128) NOT NULL,
+			RETURN_TO_ VARCHAR(2048) NOT NULL DEFAULT '/',
+			CALLBACK_URL_ VARCHAR(2048) NOT NULL DEFAULT '',
+			DESKTOP_STATE_ VARCHAR(512) NOT NULL DEFAULT '',
+			EXPIRES_AT_ DATETIME(3) NOT NULL,
+			CONSUMED_AT_ DATETIME(3) NULL,
+			CREATED_AT_ DATETIME(3) NOT NULL,
+			PRIMARY KEY (ID_),
+			UNIQUE KEY UK_AUTH_OAUTH_REQUEST_STATE_HASH (STATE_HASH_),
+			KEY IDX_AUTH_OAUTH_REQUEST_EXPIRES (EXPIRES_AT_)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS auth_desktop_sso_ticket (
 			ID_ BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -202,6 +247,12 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE auth_session ADD COLUMN CSRF_TOKEN_ VARCHAR(64) NOT NULL DEFAULT '' AFTER TOKEN_HASH_`); err != nil {
+		var mysqlErr *mysqlDriver.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1060 {
 			return err
 		}
 	}
@@ -296,49 +347,18 @@ func (s *MySQLStore) FindUserBySession(ctx context.Context, tokenHash string, no
 }
 
 func (s *MySQLStore) UpsertGoogleUser(ctx context.Context, identity GoogleIdentity, ip string) (User, error) {
-	now := time.Now().UTC()
-	email := normalizeEmail(identity.Email)
-	displayName := strings.TrimSpace(identity.Name)
-	if displayName == "" {
-		displayName = email
-	}
-
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO auth_user (EMAIL_, DISPLAY_NAME_, AVATAR_URL_, AUTH_PROVIDER_, AUTH_SUB_, ROLE_, ENABLED_, CREATED_AT_, UPDATED_AT_, LAST_LOGIN_AT_)
-		 VALUES (?, ?, ?, 'google', ?, 'user', 1, ?, ?, ?)
-		 ON DUPLICATE KEY UPDATE
-		   EMAIL_ = VALUES(EMAIL_),
-		   DISPLAY_NAME_ = VALUES(DISPLAY_NAME_),
-		   AVATAR_URL_ = VALUES(AVATAR_URL_),
-		   UPDATED_AT_ = VALUES(UPDATED_AT_),
-		   LAST_LOGIN_AT_ = VALUES(LAST_LOGIN_AT_)`,
-		email,
-		displayName,
-		strings.TrimSpace(identity.Picture),
-		strings.TrimSpace(identity.Subject),
-		now,
-		now,
-		now,
-	)
-	if err != nil {
-		return User{}, err
-	}
-
-	row := s.db.QueryRowContext(
-		ctx,
-		userSelectList+`
-		 , '' AS PASSWORD_HASH_
-		 FROM auth_user u
-		 WHERE u.AUTH_PROVIDER_ = 'google' AND u.AUTH_SUB_ = ?`,
-		strings.TrimSpace(identity.Subject),
-	)
-	user, err := scanUserWithPassword(row)
-	if err != nil {
-		return User{}, err
-	}
 	_ = ip
-	return user, nil
+	if !identity.EmailVerified {
+		return User{}, ErrNotFound
+	}
+	return s.upsertIdentityUser(
+		ctx,
+		"google",
+		strings.TrimSpace(identity.Subject),
+		normalizeEmail(identity.Email),
+		strings.TrimSpace(identity.Name),
+		strings.TrimSpace(identity.Picture),
+	)
 }
 
 func (s *MySQLStore) UpsertAuthentikUser(ctx context.Context, identity AuthentikIdentity, ip string) (User, error) {
@@ -395,41 +415,127 @@ func (s *MySQLStore) UpsertAuthentikUser(ctx context.Context, identity Authentik
 }
 
 func (s *MySQLStore) UpsertEmailCodeUser(ctx context.Context, email, ip string) (User, error) {
-	now := time.Now().UTC()
+	_ = ip
 	email = normalizeEmail(email)
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO auth_user (EMAIL_, DISPLAY_NAME_, AUTH_PROVIDER_, AUTH_SUB_, ROLE_, ENABLED_, CREATED_AT_, UPDATED_AT_, LAST_LOGIN_AT_)
-		 VALUES (?, ?, 'email_code', ?, 'user', 1, ?, ?, ?)
-		 ON DUPLICATE KEY UPDATE
-		   EMAIL_ = VALUES(EMAIL_),
-		   DISPLAY_NAME_ = IF(DISPLAY_NAME_ = '' OR DISPLAY_NAME_ = AUTH_SUB_, VALUES(DISPLAY_NAME_), DISPLAY_NAME_),
-		   UPDATED_AT_ = VALUES(UPDATED_AT_),
-		   LAST_LOGIN_AT_ = VALUES(LAST_LOGIN_AT_)`,
-		email,
-		email,
-		email,
-		now,
-		now,
-		now,
-	)
+	return s.upsertIdentityUser(ctx, "email_code", email, email, email, "")
+}
+
+func (s *MySQLStore) upsertIdentityUser(
+	ctx context.Context,
+	provider, subject, email, displayName, avatarURL string,
+) (User, error) {
+	provider = strings.TrimSpace(provider)
+	subject = strings.TrimSpace(subject)
+	email = normalizeEmail(email)
+	if provider == "" || subject == "" || !validEmail(email) {
+		return User{}, ErrNotFound
+	}
+	if displayName = strings.TrimSpace(displayName); displayName == "" {
+		displayName = email
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return User{}, err
+	}
+	defer tx.Rollback()
+
+	var userID int64
+	row := tx.QueryRowContext(
+		ctx,
+		`SELECT USER_ID_ FROM auth_identity WHERE PROVIDER_ = ? AND SUBJECT_ = ? FOR UPDATE`,
+		provider,
+		subject,
+	)
+	err = row.Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		row = tx.QueryRowContext(
+			ctx,
+			`SELECT ID_ FROM auth_user WHERE EMAIL_ = ? ORDER BY (ROLE_ = 'admin') DESC, ID_ ASC LIMIT 1 FOR UPDATE`,
+			email,
+		)
+		err = row.Scan(&userID)
+		if errors.Is(err, sql.ErrNoRows) {
+			result, insertErr := tx.ExecContext(
+				ctx,
+				`INSERT INTO auth_user
+				 (EMAIL_, DISPLAY_NAME_, AVATAR_URL_, AUTH_PROVIDER_, AUTH_SUB_, ROLE_, ENABLED_, CREATED_AT_, UPDATED_AT_, LAST_LOGIN_AT_)
+				 VALUES (?, ?, ?, ?, ?, 'user', 1, ?, ?, ?)`,
+				email,
+				displayName,
+				avatarURL,
+				provider,
+				subject,
+				now,
+				now,
+				now,
+			)
+			if insertErr != nil {
+				return User{}, insertErr
+			}
+			userID, err = result.LastInsertId()
+		}
+		if err != nil {
+			return User{}, err
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			`INSERT INTO auth_identity
+			 (USER_ID_, PROVIDER_, SUBJECT_, EMAIL_, EMAIL_VERIFIED_, CREATED_AT_, UPDATED_AT_)
+			 VALUES (?, ?, ?, ?, 1, ?, ?)`,
+			userID,
+			provider,
+			subject,
+			email,
+			now,
+			now,
+		); err != nil {
+			return User{}, err
+		}
+	} else if err != nil {
 		return User{}, err
 	}
 
-	row := s.db.QueryRowContext(
+	if _, err := tx.ExecContext(
 		ctx,
-		userSelectList+`
-		 , '' AS PASSWORD_HASH_
-		 FROM auth_user u
-		 WHERE u.AUTH_PROVIDER_ = 'email_code' AND u.AUTH_SUB_ = ?`,
+		`UPDATE auth_user
+		 SET EMAIL_ = ?, DISPLAY_NAME_ = IF(? = '', DISPLAY_NAME_, ?),
+		     AVATAR_URL_ = IF(? = '', AVATAR_URL_, ?), UPDATED_AT_ = ?, LAST_LOGIN_AT_ = ?
+		 WHERE ID_ = ?`,
 		email,
-	)
-	user, err := scanUserWithPassword(row)
+		displayName,
+		displayName,
+		avatarURL,
+		avatarURL,
+		now,
+		now,
+		userID,
+	); err != nil {
+		return User{}, err
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE auth_identity SET EMAIL_ = ?, EMAIL_VERIFIED_ = 1, UPDATED_AT_ = ?
+		 WHERE PROVIDER_ = ? AND SUBJECT_ = ?`,
+		email,
+		now,
+		provider,
+		subject,
+	); err != nil {
+		return User{}, err
+	}
+
+	user, err := scanUserWithPassword(tx.QueryRowContext(
+		ctx,
+		userSelectList+`, '' AS PASSWORD_HASH_ FROM auth_user u WHERE u.ID_ = ?`,
+		userID,
+	))
 	if err != nil {
 		return User{}, err
 	}
-	_ = ip
+	if err := tx.Commit(); err != nil {
+		return User{}, err
+	}
 	return user, nil
 }
 
@@ -482,14 +588,82 @@ func (s *MySQLStore) ConsumeEmailCode(ctx context.Context, email, codeHash strin
 	return tx.Commit()
 }
 
-func (s *MySQLStore) CreateSession(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time, userAgent, ip string) error {
+func (s *MySQLStore) SaveOAuthRequest(ctx context.Context, stateHash string, request OAuthRequest) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO auth_session (USER_ID_, TOKEN_HASH_, EXPIRES_AT_, CREATED_AT_, LAST_SEEN_AT_, USER_AGENT_, IP_)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO auth_oauth_request
+		 (STATE_HASH_, KIND_, NONCE_, CODE_VERIFIER_, RETURN_TO_, CALLBACK_URL_, DESKTOP_STATE_, EXPIRES_AT_, CREATED_AT_)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		stateHash,
+		truncate(strings.TrimSpace(request.Kind), 32),
+		truncate(strings.TrimSpace(request.Nonce), 128),
+		truncate(strings.TrimSpace(request.CodeVerifier), 128),
+		truncate(strings.TrimSpace(request.ReturnTo), 2048),
+		truncate(strings.TrimSpace(request.CallbackURL), 2048),
+		truncate(strings.TrimSpace(request.DesktopState), 512),
+		request.ExpiresAt,
+		now,
+	)
+	return err
+}
+
+func (s *MySQLStore) ConsumeOAuthRequest(ctx context.Context, stateHash string, now time.Time) (OAuthRequest, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return OAuthRequest{}, err
+	}
+	defer tx.Rollback()
+
+	var request OAuthRequest
+	row := tx.QueryRowContext(
+		ctx,
+		`SELECT KIND_, NONCE_, CODE_VERIFIER_, RETURN_TO_, CALLBACK_URL_, DESKTOP_STATE_, EXPIRES_AT_
+		 FROM auth_oauth_request
+		 WHERE STATE_HASH_ = ? AND CONSUMED_AT_ IS NULL
+		 FOR UPDATE`,
+		stateHash,
+	)
+	if err := row.Scan(
+		&request.Kind,
+		&request.Nonce,
+		&request.CodeVerifier,
+		&request.ReturnTo,
+		&request.CallbackURL,
+		&request.DesktopState,
+		&request.ExpiresAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return OAuthRequest{}, ErrNotFound
+		}
+		return OAuthRequest{}, err
+	}
+	if !request.ExpiresAt.After(now) {
+		return OAuthRequest{}, ErrNotFound
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE auth_oauth_request SET CONSUMED_AT_ = ? WHERE STATE_HASH_ = ?`,
+		now,
+		stateHash,
+	); err != nil {
+		return OAuthRequest{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OAuthRequest{}, err
+	}
+	return request, nil
+}
+
+func (s *MySQLStore) CreateSession(ctx context.Context, userID int64, tokenHash, csrfToken string, expiresAt time.Time, userAgent, ip string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO auth_session (USER_ID_, TOKEN_HASH_, CSRF_TOKEN_, EXPIRES_AT_, CREATED_AT_, LAST_SEEN_AT_, USER_AGENT_, IP_)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		userID,
 		tokenHash,
+		csrfToken,
 		expiresAt,
 		now,
 		now,
@@ -497,6 +671,20 @@ func (s *MySQLStore) CreateSession(ctx context.Context, userID int64, tokenHash 
 		truncate(strings.TrimSpace(ip), 64),
 	)
 	return err
+}
+
+func (s *MySQLStore) FindSessionCSRF(ctx context.Context, tokenHash string, now time.Time) (string, error) {
+	var csrfToken string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT CSRF_TOKEN_ FROM auth_session WHERE TOKEN_HASH_ = ? AND EXPIRES_AT_ > ?`,
+		tokenHash,
+		now,
+	).Scan(&csrfToken)
+	if errors.Is(err, sql.ErrNoRows) || csrfToken == "" {
+		return "", ErrNotFound
+	}
+	return csrfToken, err
 }
 
 func (s *MySQLStore) RevokeSession(ctx context.Context, tokenHash string) error {

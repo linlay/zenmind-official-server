@@ -17,6 +17,7 @@ type memoryStore struct {
 	email     map[string]int64
 	tickets   map[string]desktopSsoTicketRecord
 	sessions  map[string]sessionRecord
+	oauth     map[string]oauthRequestRecord
 	logins    []LoginLog
 	codes     []emailCodeRecord
 	stats     map[string]int64
@@ -25,8 +26,14 @@ type memoryStore struct {
 
 type sessionRecord struct {
 	userID    int64
+	csrfToken string
 	expiresAt time.Time
 	revoked   bool
+}
+
+type oauthRequestRecord struct {
+	request    OAuthRequest
+	consumedAt *time.Time
 }
 
 type desktopSsoTicketRecord struct {
@@ -52,6 +59,7 @@ func newMemoryStore() *memoryStore {
 		email:     map[string]int64{},
 		tickets:   map[string]desktopSsoTicketRecord{},
 		sessions:  map[string]sessionRecord{},
+		oauth:     map[string]oauthRequestRecord{},
 		stats:     map[string]int64{},
 	}
 }
@@ -117,19 +125,22 @@ func (s *memoryStore) UpsertGoogleUser(_ context.Context, identity GoogleIdentit
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	subject := normalizeEmail(identity.Subject)
-	if subject == "" {
+	subject := strings.TrimSpace(identity.Subject)
+	email := normalizeEmail(identity.Email)
+	if subject == "" || !identity.EmailVerified || !validEmail(email) {
 		return User{}, ErrNotFound
 	}
 
 	userID, exists := s.google[subject]
 	if !exists {
-		userID = s.nextID
-		s.nextID++
+		userID = s.userIDByEmail(email)
+		if userID == 0 {
+			userID = s.nextID
+			s.nextID++
+		}
 		s.google[subject] = userID
 	}
 
-	email := normalizeEmail(identity.Email)
 	displayName := identity.Name
 	if displayName == "" {
 		displayName = email
@@ -199,8 +210,11 @@ func (s *memoryStore) UpsertEmailCodeUser(_ context.Context, email, _ string) (U
 	email = normalizeEmail(email)
 	userID, exists := s.email[email]
 	if !exists {
-		userID = s.nextID
-		s.nextID++
+		userID = s.userIDByEmail(email)
+		if userID == 0 {
+			userID = s.nextID
+			s.nextID++
+		}
 		s.email[email] = userID
 	}
 
@@ -208,12 +222,27 @@ func (s *memoryStore) UpsertEmailCodeUser(_ context.Context, email, _ string) (U
 	user.ID = userID
 	user.Email = email
 	user.DisplayName = email
-	user.AuthProvider = "email_code"
-	user.AuthSub = email
-	user.Role = "user"
-	user.Enabled = true
+	if user.AuthProvider == "" {
+		user.AuthProvider = "email_code"
+		user.AuthSub = email
+	}
+	if user.Role == "" {
+		user.Role = "user"
+	}
+	if !exists && !user.Enabled {
+		user.Enabled = true
+	}
 	s.users[userID] = user
 	return user, nil
+}
+
+func (s *memoryStore) userIDByEmail(email string) int64 {
+	for userID, user := range s.users {
+		if normalizeEmail(user.Email) == email {
+			return userID
+		}
+	}
+	return 0
 }
 
 func (s *memoryStore) SaveEmailCode(_ context.Context, email, codeHash string, expiresAt time.Time) error {
@@ -248,12 +277,42 @@ func (s *memoryStore) ConsumeEmailCode(_ context.Context, email, codeHash string
 	return ErrNotFound
 }
 
-func (s *memoryStore) CreateSession(_ context.Context, userID int64, tokenHash string, expiresAt time.Time, _, _ string) error {
+func (s *memoryStore) SaveOAuthRequest(_ context.Context, stateHash string, request OAuthRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.oauth[stateHash] = oauthRequestRecord{request: request}
+	return nil
+}
+
+func (s *memoryStore) ConsumeOAuthRequest(_ context.Context, stateHash string, now time.Time) (OAuthRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.oauth[stateHash]
+	if !ok || record.consumedAt != nil || !record.request.ExpiresAt.After(now) {
+		return OAuthRequest{}, ErrNotFound
+	}
+	consumedAt := now
+	record.consumedAt = &consumedAt
+	s.oauth[stateHash] = record
+	return record.request, nil
+}
+
+func (s *memoryStore) CreateSession(_ context.Context, userID int64, tokenHash, csrfToken string, expiresAt time.Time, _, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.sessions[tokenHash] = sessionRecord{userID: userID, expiresAt: expiresAt}
+	s.sessions[tokenHash] = sessionRecord{userID: userID, csrfToken: csrfToken, expiresAt: expiresAt}
 	return nil
+}
+
+func (s *memoryStore) FindSessionCSRF(_ context.Context, tokenHash string, now time.Time) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.sessions[tokenHash]
+	if !ok || session.revoked || !session.expiresAt.After(now) || session.csrfToken == "" {
+		return "", ErrNotFound
+	}
+	return session.csrfToken, nil
 }
 
 func (s *memoryStore) RevokeSession(_ context.Context, tokenHash string) error {
