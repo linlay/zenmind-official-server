@@ -1172,6 +1172,11 @@ func TestMarketProxyStripsSpoofedIdentityAndInjectsShortJWT(t *testing.T) {
 	if err := EnsureInitialAdmin(context.Background(), store, "admin@zenmind.cc", "correct-password"); err != nil {
 		t.Fatalf("init admin: %v", err)
 	}
+	store.mu.Lock()
+	user := store.users[1]
+	user.AvatarURL = "https://example.com/avatar.png"
+	store.users[1] = user
+	store.mu.Unlock()
 	server := NewServer(store, ServerOptions{
 		CookieName:        "test_session",
 		SessionTTL:        time.Hour,
@@ -1179,6 +1184,11 @@ func TestMarketProxyStripsSpoofedIdentityAndInjectsShortJWT(t *testing.T) {
 		MarketServerURL:   market.URL,
 		MarketJWTAudience: "market",
 		MarketJWTTTL:      90 * time.Second,
+		AvatarProxy: AvatarProxyConfig{
+			Enabled:        true,
+			PublicOrigin:   "https://www.zenmind.cc",
+			AllowedOrigins: []string{"https://example.com"},
+		},
 	})
 	handler := server.Routes()
 
@@ -1214,6 +1224,12 @@ func TestMarketProxyStripsSpoofedIdentityAndInjectsShortJWT(t *testing.T) {
 	}
 	if int64(claims["exp"].(float64)-claims["iat"].(float64)) != 90 {
 		t.Fatalf("unexpected gateway ttl: %#v", claims)
+	}
+	if picture, _ := claims["picture"].(string); !strings.HasPrefix(
+		picture,
+		"https://www.zenmind.cc/api/auth/avatar/",
+	) {
+		t.Fatalf("market gateway picture exposed upstream URL: %#v", claims)
 	}
 }
 

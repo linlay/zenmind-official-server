@@ -30,6 +30,7 @@ Go 1.26 backend for the ZenMind official site login flow.
 - `GET /api/auth/sso/session`
 - `GET /api/auth/csrf`
 - `GET /api/auth/me`
+- `GET /api/auth/avatar/{version}`
 - `POST /api/auth/logout`
 - `/api/market/*`
 - `GET /api/downloads/stats`
@@ -63,12 +64,22 @@ Required values:
 - `MARKET_SERVER_URL`, `MARKET_JWT_AUDIENCE=market`, and `MARKET_JWT_TTL=90s`
 - `TRUSTED_PROXY_CIDRS`, restricted to the deployment Docker network such as `172.20.0.0/16`
 - `AUTH_SUCCESS_URL`, `AUTH_FAILURE_URL`
+- `AUTH_PUBLIC_ORIGIN` for absolute public API URLs such as the authenticated avatar endpoint
+- `AVATAR_PROXY_ENABLED`, `AVATAR_UPSTREAM_ORIGINS`, and `AVATAR_CACHE_DIR`; production
+  serves provider avatars through the authenticated `/api/auth/avatar/{version}` route
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`
 - `SQLITE_DB_PATH` for the local SQLite site data store, defaulting to `/data/data.sqlite` in the container
 
 Optional values:
 
 - `GOOGLE_DESKTOP_CLIENT_ID` when the desktop app uses a separate Google OAuth client id
+
+Avatar proxy downloads are restricted to the exact HTTPS origins in
+`AVATAR_UPSTREAM_ORIGINS`. Cached files are stored under `AVATAR_CACHE_DIR`
+(`/data/avatars` by default); the raw provider URL remains server-side and
+authenticated user responses expose only the `AUTH_PUBLIC_ORIGIN` avatar URL.
+`GET /api/auth/avatar/{version}` requires the current website session Cookie;
+accounts without an avatar URL continue to receive an empty `avatarUrl`.
 
 The Google web client must register the exact callback configured by
 `GOOGLE_REDIRECT_URL`; production uses

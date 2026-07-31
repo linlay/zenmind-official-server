@@ -44,6 +44,7 @@ type Server struct {
 	mailer             Mailer
 	installerCatalog   release.Catalog
 	downloadStore      DownloadStore
+	avatarProxy        *avatarProxy
 	rateLimiter        *rateLimiter
 	now                func() time.Time
 }
@@ -68,6 +69,7 @@ type ServerOptions struct {
 	Mailer             Mailer
 	InstallerCatalog   release.Catalog
 	DownloadStore      DownloadStore
+	AvatarProxy        AvatarProxyConfig
 }
 
 func NewServer(store Store, opts ServerOptions) *Server {
@@ -134,6 +136,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		mailer:             mailer,
 		installerCatalog:   opts.InstallerCatalog,
 		downloadStore:      downloadStore,
+		avatarProxy:        newAvatarProxy(opts.AvatarProxy),
 		rateLimiter:        newRateLimiter(),
 		now:                time.Now,
 	}
@@ -159,6 +162,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/auth/sso/session", s.authentikSsoSession)
 	mux.HandleFunc("GET /api/auth/csrf", s.csrf)
 	mux.HandleFunc("GET /api/auth/me", s.me)
+	mux.HandleFunc("GET /api/auth/avatar/{version}", s.avatar)
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
 	mux.HandleFunc("/api/market/", s.marketProxy)
 	return securityHeaders(mux)
@@ -283,7 +287,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "local", LoginResult: "success"})
 
 	http.SetCookie(w, s.sessionCookie(token, expiresAt))
-	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
+	writeJSON(w, http.StatusOK, map[string]any{"user": s.publicUser(user)})
 }
 
 func (s *Server) emailCodeStart(w http.ResponseWriter, r *http.Request) {
@@ -376,7 +380,7 @@ func (s *Server) emailCodeVerify(w http.ResponseWriter, r *http.Request) {
 	s.recordLogin(r, LoginLog{UserID: &user.ID, Email: user.Email, DisplayName: user.DisplayName, AuthMethod: "email_code", LoginResult: "success"})
 
 	http.SetCookie(w, s.sessionCookie(token, expiresAt))
-	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
+	writeJSON(w, http.StatusOK, map[string]any{"user": s.publicUser(user)})
 }
 
 func (s *Server) downloadStats(w http.ResponseWriter, r *http.Request) {
@@ -741,7 +745,7 @@ func (s *Server) writeDesktopSsoSessionResponse(w http.ResponseWriter, r *http.R
 	http.SetCookie(w, s.sessionCookie(sessionToken, sessionExpiresAt))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":        true,
-		"user":      publicUser(user),
+		"user":      s.publicUser(user),
 		"expiresAt": sessionExpiresAt,
 	})
 }
@@ -764,14 +768,16 @@ func (s *Server) desktopSsoToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
 		return
 	}
-	jwtToken, err := s.desktopJWTSigner.issue(user, s.now(), tokenHash(sessionToken))
+	tokenUser := user
+	tokenUser.AvatarURL = s.avatarProxy.publicURL(user)
+	jwtToken, err := s.desktopJWTSigner.issue(tokenUser, s.now(), tokenHash(sessionToken))
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "sso_jwt_not_configured", "Desktop SSO JWT signer is not configured.")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
-		"user":        publicUser(user),
+		"user":        s.publicUser(user),
 		"accessToken": jwtToken.Token,
 		"tokenType":   "Bearer",
 		"expiresAt":   jwtToken.ExpiresAt,
@@ -851,7 +857,24 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read session.")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
+	writeJSON(w, http.StatusOK, map[string]any{"user": s.publicUser(user)})
+}
+
+func (s *Server) avatar(w http.ResponseWriter, r *http.Request) {
+	user, err := s.currentUser(r)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
+		return
+	}
+	if errors.Is(err, ErrDisabledUser) {
+		writeError(w, http.StatusForbidden, "account_disabled", "This account is disabled.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read session.")
+		return
+	}
+	s.avatarProxy.serve(w, r, user, strings.TrimSpace(r.PathValue("version")))
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
@@ -940,8 +963,10 @@ func (s *Server) marketProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sessionToken, _ := s.sessionToken(r)
+		tokenUser := user
+		tokenUser.AvatarURL = s.avatarProxy.publicURL(user)
 		jwtToken, signErr := s.desktopJWTSigner.issueWithPolicy(
-			user,
+			tokenUser,
 			s.now(),
 			tokenHash(sessionToken),
 			[]string{s.marketJWTAudience},
@@ -1103,14 +1128,14 @@ func singleJoiningSlash(left, right string) string {
 	}
 }
 
-func publicUser(user User) map[string]any {
+func (s *Server) publicUser(user User) map[string]any {
 	return map[string]any{
 		"id":           user.ID,
 		"email":        user.Email,
 		"role":         user.Role,
 		"enabled":      user.Enabled,
 		"displayName":  user.DisplayName,
-		"avatarUrl":    user.AvatarURL,
+		"avatarUrl":    s.avatarProxy.publicURL(user),
 		"authProvider": user.AuthProvider,
 		"lastLoginAt":  user.LastLoginAt,
 	}
