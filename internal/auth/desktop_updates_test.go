@@ -13,6 +13,10 @@ import (
 )
 
 func TestAdminNamedUpdates(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) { testAdminNamedUpdates(t, false) })
+	t.Run("directory", func(t *testing.T) { testAdminNamedUpdates(t, true) })
+}
+func testAdminNamedUpdates(t *testing.T, directory bool) {
 	ctx := context.Background()
 	catalog, err := release.OpenSQLite(ctx, filepath.Join(t.TempDir(), "site.sqlite"))
 	if err != nil {
@@ -21,6 +25,15 @@ func TestAdminNamedUpdates(t *testing.T) {
 	defer catalog.Close()
 	if err := catalog.EnsureSchema(ctx); err != nil {
 		t.Fatal(err)
+	}
+	var provider release.DesktopUpdateCatalog = catalog
+	if directory {
+		files, err := release.OpenDirectoryUpdates(ctx, t.TempDir(), catalog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer files.Close()
+		provider = files
 	}
 	store := newMemoryStore()
 	if err := store.EnsureAdmin(ctx, "admin@example.com", "test-hash"); err != nil {
@@ -33,7 +46,7 @@ func TestAdminNamedUpdates(t *testing.T) {
 	if err := store.CreateSession(ctx, user.ID, tokenHash("session"), "csrf", time.Now().Add(time.Hour), "test", "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
-	handler := NewServer(store, ServerOptions{CookieName: "session", DesktopUpdates: catalog}).Routes()
+	handler := NewServer(store, ServerOptions{CookieName: "session", DesktopUpdates: provider}).Routes()
 	request := func(method, path, body string, session, csrf bool, origin string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(method, "https://example.com"+path, strings.NewReader(body))
@@ -93,6 +106,13 @@ func TestAdminNamedUpdates(t *testing.T) {
 	check(request("GET", "/api/admin/updates", "", true, false, ""), 200)
 	check(request("GET", admin+"/history", "", true, false, ""), 200)
 	disabled := strings.Replace(strings.Replace(body, `"revision":0`, `"revision":1`, 1), `"enabled":true`, `"enabled":false`, 1)
+	if directory {
+		current, err := provider.GetUpdateFeed(ctx, "desktop-beta.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		disabled = strings.Replace(disabled, `"revision":1`, `"revision":1,"etag":"`+current.ETag+`"`, 1)
+	}
 	check(request("PUT", admin, disabled, true, true, ""), 200)
 	rec = request("GET", "/api/updates/desktop-beta.json", "", false, false, "")
 	check(rec, 404)

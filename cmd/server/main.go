@@ -62,6 +62,12 @@ func run() error {
 		return err
 	}
 
+	updateFiles, err := release.OpenDirectoryUpdates(ctx, cfg.UpdatesDir, installerCatalog)
+	if err != nil {
+		return err
+	}
+	defer updateFiles.Close()
+
 	app := auth.NewServer(store, auth.ServerOptions{
 		CookieName:        cfg.CookieName,
 		CookieSecure:      cfg.CookieSecure,
@@ -101,7 +107,7 @@ func run() error {
 		MarketJWTAudience: cfg.MarketJWTAudience,
 		MarketJWTTTL:      cfg.MarketJWTTTL,
 		InstallerCatalog:  installerCatalog,
-		DesktopUpdates:    installerCatalog,
+		DesktopUpdates:    updateFiles,
 		DownloadStore:     downloadStore,
 		Mailer: auth.NewSMTPMailer(auth.SMTPMailerConfig{
 			Host:     cfg.SMTPHost,

@@ -57,6 +57,7 @@ type Config struct {
 	MarketServerURL       string
 	MarketProxyToken      string
 	SQLiteDBPath          string
+	UpdatesDir            string
 }
 
 func FromEnv() (Config, error) {
@@ -99,6 +100,7 @@ func FromEnv() (Config, error) {
 		MarketServerURL:       strings.TrimRight(env("MARKET_SERVER_URL", "http://zenmind-market-server:8088"), "/"),
 		MarketProxyToken:      os.Getenv("MARKET_PROXY_TOKEN"),
 		SQLiteDBPath:          env(sqliteDBPathEnv, defaultSQLiteDBPath),
+		UpdatesDir:            env("UPDATES_DIR", "/data/updates"),
 	}
 
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")

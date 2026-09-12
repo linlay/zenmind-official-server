@@ -142,44 +142,62 @@ docker build -t zenmind-official-server .
 docker run --env-file .env -p 8080:8080 zenmind-official-server
 ```
 
-## Named update feeds and Admin
+## File-based update feeds and Admin
 
-`GET /api/updates/{name}` publicly serves one named Desktop v1 manifest directly,
-without a `data` wrapper. Names are unique lowercase letters/numbers/hyphens ending
-in `.json`, for example `desktop-latest.json` and `desktop-beta.json`. Names are
-stable identifiers, never filesystem paths. An absent/disabled feed returns 404;
-invalid storage returns 503. All public and Admin responses use `Cache-Control:
-no-store` so enable/disable takes effect without stale cached metadata.
+`UPDATES_DIR` sets the directory of public JSON files (default `/data/updates` in
+containers). Compose already mounts `./data:/data`, so the host directory is
+`./data/updates` relative to the server deployment directory.
 
-Admin APIs (valid enabled administrator Cookie session required on every request):
+```text
+data/updates/
+  desktop-latest.json
+  desktop-beta.json
+  .disabled/               # Disabled files, not public
+  .admin/                  # Private descriptions and Admin history
+```
 
-- `GET /api/admin/updates`: list feed metadata.
-- `GET /api/admin/updates/{name}`: current metadata and manifest.
-- `GET /api/admin/updates/{name}/history`: last 20 immutable revisions.
-- `PUT /api/admin/updates/{name}`: create/update with `{description, enabled,
-  revision, manifest}`. Also requires session `X-CSRF-Token` and valid Origin.
+For example, on a server deployed at `/docker/zenmind-official-server`, put a file
+at `/docker/zenmind-official-server/data/updates/desktop-latest.json`. It becomes
+available at `/api/updates/desktop-latest.json` immediately. No database registration,
+Admin action or restart is required. Replace files using temporary files and rename
+so clients cannot read a partially copied file. Remove a public file to return 404.
+Only regular files with lowercase letters/numbers/hyphens ending in `.json` are
+exposed; nested paths, symlinks and directory listings are not served. Valid JSON
+up to 256 KiB is returned verbatim with `application/json` and `Cache-Control:
+no-store`; malformed/oversized files return 503. Public access does not depend on
+Admin metadata or database state, and permits future JSON document schemas.
 
-Use `revision: 0` to create; updates must submit the current revision. Stale saves
-return 409 without changing anything. Name cannot be renamed; create a different
-name if a new public URL is needed. A save to an enabled feed immediately changes
-its public response. Disabling is an audited revision too. Restoring historical
-content means saving it as a new revision against the current revision number.
+Admin maintains Desktop v1 manifests in the same directory. Saving replaces a
+file atomically; disabling moves the content into `.disabled/`, enabling puts it
+back in the public directory. Directly added Desktop manifests appear in Admin.
+Descriptions and history are private sidecar files in `.admin/` and never make a
+missing public file accessible. Admin retains its last-20-history view and restore
+workflow. Manual filesystem changes are not automatically recorded as revisions.
 
-`update_feed` owns each current pointer; `update_feed_revision` stores complete
-immutable snapshots, description, enabled state, timestamp and administrator user
-ID. Both writes share one transaction. Startup migrates the previous singleton
-once to `desktop-latest.json`, preserving its current pointer and all legacy
-history, and retains legacy tables as migration evidence. Empty stores stay empty.
+Admin APIs require an enabled administrator Cookie session:
 
-The manifest uses `schemaVersion: 1`, `productId`, `channel`, semantic `version`,
-`publishedAt`, localized `releaseNotes`, and platform/architecture `artifacts`
-with absolute HTTPS `url`, byte `size`, and `sha256`. Stable rejects prereleases;
-beta and other explicitly named channels allow valid prerelease SemVer. Clients
-must configure a matching channel; filenames do not implicitly select channels.
-macOS uses ZIP, Windows EXE. The existing `/api/installers` DMG catalog is separate.
+- `GET /api/admin/updates`: list files and metadata.
+- `GET /api/admin/updates/{name}`: current file and metadata.
+- `GET /api/admin/updates/{name}/history`: latest 20 Admin revisions.
+- `PUT /api/admin/updates/{name}`: save `{description, enabled, revision, etag,
+  manifest}` with a valid session `X-CSRF-Token` and Origin. Echo revision and etag
+  from the loaded file; new files use revision zero and no etag. Stale editors
+  receive 409, including when a file was manually replaced after loading.
 
-Admin edits only metadata: upload and verify actual signed artifacts before
-saving an enabled feed. This API never fetches arbitrary URLs or uploads binaries,
-and does not claim to verify remote artifact bytes. Desktop verifies downloaded
-bytes and platform signatures. No releasectl command was added. The frontend
-management UI is in the sibling `zenmind-official-website` Admin page.
+On the first start, existing SQLite feeds are exported to the directory along
+with ALL history and descriptions. Existing files are never overwritten. SQLite
+records remain intact. `.admin/.sqlite-exported` prevents repeated export: deleting
+an exported file will not resurrect it on restart. Keep the entire updates
+directory, including hidden files, when backing up or migrating a deployment.
+
+Use one backend writer instance and coordinate manual publishing with Admin;
+external filesystem writes cannot participate in the Admin process lock. The
+public file and history sidecar are separate atomic replacements, not a single
+transaction. If a filesystem error interrupts saving, inspect the public file and
+reload before retrying. Public serving always reflects the file actually present.
+
+Desktop manifests use schemaVersion/productId/channel/version/publishedAt/
+releaseNotes/artifacts with HTTPS URLs, byte sizes and SHA-256. macOS uses ZIP;
+Windows uses EXE. The Admin validates this schema; Desktop validates downloaded
+content and signatures. Upload signed installers separately. No releasectl command
+is added. The existing `/api/installers` catalog is unchanged.

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"github.com/linlay/zenmind-official-server/internal/release"
@@ -16,6 +17,21 @@ func (s *Server) desktopLatest(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.desktopUpdates == nil {
 		s.updateError(w, errors.New("unavailable"))
+		return
+	}
+	// Directory providers serve the original JSON, including future document fields.
+	if files, ok := s.desktopUpdates.(interface {
+		GetPublicJSON(context.Context, string) ([]byte, error)
+	}); ok {
+		data, err := files.GetPublicJSON(r.Context(), r.PathValue("name"))
+		if err != nil {
+			s.updateError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
 		return
 	}
 	manifest, err := s.desktopUpdates.GetPublicUpdate(r.Context(), r.PathValue("name"))

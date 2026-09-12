@@ -17,6 +17,7 @@ var feedNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,79}\.json$`)
 func ValidUpdateName(name string) bool { return feedNamePattern.MatchString(name) }
 
 type UpdateFeed struct {
+	ETag        string           `json:"etag,omitempty"`
 	Name        string           `json:"name"`
 	Description string           `json:"description"`
 	Enabled     bool             `json:"enabled"`
@@ -26,6 +27,7 @@ type UpdateFeed struct {
 	Manifest    *DesktopManifest `json:"manifest,omitempty"`
 }
 type UpdateFeedInput struct {
+	ETag        string          `json:"etag,omitempty"`
 	Description string          `json:"description"`
 	Enabled     *bool           `json:"enabled"`
 	Revision    int64           `json:"revision"`
