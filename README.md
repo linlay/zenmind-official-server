@@ -17,6 +17,7 @@ Go 1.26 backend for the ZenMind official site login flow.
 ## API
 
 - `GET /api/health`
+- `GET /api/updates/desktop-latest.json`
 - `POST /api/auth/login`
 - `POST /api/auth/email-code/start`
 - `POST /api/auth/email-code/verify`
@@ -140,3 +141,45 @@ For a standalone image build:
 docker build -t zenmind-official-server .
 docker run --env-file .env -p 8080:8080 zenmind-official-server
 ```
+
+## Named update feeds and Admin
+
+`GET /api/updates/{name}` publicly serves one named Desktop v1 manifest directly,
+without a `data` wrapper. Names are unique lowercase letters/numbers/hyphens ending
+in `.json`, for example `desktop-latest.json` and `desktop-beta.json`. Names are
+stable identifiers, never filesystem paths. An absent/disabled feed returns 404;
+invalid storage returns 503. All public and Admin responses use `Cache-Control:
+no-store` so enable/disable takes effect without stale cached metadata.
+
+Admin APIs (valid enabled administrator Cookie session required on every request):
+
+- `GET /api/admin/updates`: list feed metadata.
+- `GET /api/admin/updates/{name}`: current metadata and manifest.
+- `GET /api/admin/updates/{name}/history`: last 20 immutable revisions.
+- `PUT /api/admin/updates/{name}`: create/update with `{description, enabled,
+  revision, manifest}`. Also requires session `X-CSRF-Token` and valid Origin.
+
+Use `revision: 0` to create; updates must submit the current revision. Stale saves
+return 409 without changing anything. Name cannot be renamed; create a different
+name if a new public URL is needed. A save to an enabled feed immediately changes
+its public response. Disabling is an audited revision too. Restoring historical
+content means saving it as a new revision against the current revision number.
+
+`update_feed` owns each current pointer; `update_feed_revision` stores complete
+immutable snapshots, description, enabled state, timestamp and administrator user
+ID. Both writes share one transaction. Startup migrates the previous singleton
+once to `desktop-latest.json`, preserving its current pointer and all legacy
+history, and retains legacy tables as migration evidence. Empty stores stay empty.
+
+The manifest uses `schemaVersion: 1`, `productId`, `channel`, semantic `version`,
+`publishedAt`, localized `releaseNotes`, and platform/architecture `artifacts`
+with absolute HTTPS `url`, byte `size`, and `sha256`. Stable rejects prereleases;
+beta and other explicitly named channels allow valid prerelease SemVer. Clients
+must configure a matching channel; filenames do not implicitly select channels.
+macOS uses ZIP, Windows EXE. The existing `/api/installers` DMG catalog is separate.
+
+Admin edits only metadata: upload and verify actual signed artifacts before
+saving an enabled feed. This API never fetches arbitrary URLs or uploads binaries,
+and does not claim to verify remote artifact bytes. Desktop verifies downloaded
+bytes and platform signatures. No releasectl command was added. The frontend
+management UI is in the sibling `zenmind-official-website` Admin page.

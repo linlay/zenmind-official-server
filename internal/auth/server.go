@@ -43,6 +43,7 @@ type Server struct {
 	marketJWTTTL       time.Duration
 	mailer             Mailer
 	installerCatalog   release.Catalog
+	desktopUpdates     release.DesktopUpdateCatalog
 	downloadStore      DownloadStore
 	avatarProxy        *avatarProxy
 	rateLimiter        *rateLimiter
@@ -68,6 +69,7 @@ type ServerOptions struct {
 	MarketJWTTTL       time.Duration
 	Mailer             Mailer
 	InstallerCatalog   release.Catalog
+	DesktopUpdates     release.DesktopUpdateCatalog
 	DownloadStore      DownloadStore
 	AvatarProxy        AvatarProxyConfig
 }
@@ -135,6 +137,7 @@ func NewServer(store Store, opts ServerOptions) *Server {
 		marketJWTTTL:       marketJWTTTL,
 		mailer:             mailer,
 		installerCatalog:   opts.InstallerCatalog,
+		desktopUpdates:     opts.DesktopUpdates,
 		downloadStore:      downloadStore,
 		avatarProxy:        newAvatarProxy(opts.AvatarProxy),
 		rateLimiter:        newRateLimiter(),
@@ -146,6 +149,11 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/installers", s.installers)
+	mux.HandleFunc("GET /api/updates/{name}", s.desktopLatest)
+	mux.HandleFunc("GET /api/admin/updates", s.adminUpdateList)
+	mux.HandleFunc("GET /api/admin/updates/{name}", s.adminUpdateDetail)
+	mux.HandleFunc("GET /api/admin/updates/{name}/history", s.adminUpdateHistory)
+	mux.HandleFunc("PUT /api/admin/updates/{name}", s.adminUpdateSave)
 	mux.HandleFunc("GET /api/downloads/stats", s.downloadStats)
 	mux.HandleFunc("POST /api/downloads/events", s.downloadEvent)
 	mux.HandleFunc("POST /api/auth/login", s.login)

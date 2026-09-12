@@ -104,7 +104,10 @@ func (c *SQLiteCatalog) EnsureSchema(ctx context.Context) error {
 		CREATED_AT_ TEXT NOT NULL,
 		UPDATED_AT_ TEXT NOT NULL
 	)`)
-	return err
+	if err != nil {
+		return err
+	}
+	return c.ensureDesktopUpdateSchema(ctx)
 }
 
 func (c *SQLiteCatalog) ListInstallers(ctx context.Context) ([]Installer, error) {

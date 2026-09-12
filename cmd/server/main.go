@@ -101,6 +101,7 @@ func run() error {
 		MarketJWTAudience: cfg.MarketJWTAudience,
 		MarketJWTTTL:      cfg.MarketJWTTTL,
 		InstallerCatalog:  installerCatalog,
+		DesktopUpdates:    installerCatalog,
 		DownloadStore:     downloadStore,
 		Mailer: auth.NewSMTPMailer(auth.SMTPMailerConfig{
 			Host:     cfg.SMTPHost,
