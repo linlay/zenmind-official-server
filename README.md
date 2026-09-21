@@ -196,8 +196,10 @@ public file and history sidecar are separate atomic replacements, not a single
 transaction. If a filesystem error interrupts saving, inspect the public file and
 reload before retrying. Public serving always reflects the file actually present.
 
-Desktop manifests use schemaVersion/productId/channel/version/publishedAt/
+Desktop manifests use schemaVersion/productId/version/publishedAt/
 releaseNotes/artifacts with HTTPS URLs, byte sizes and SHA-256. macOS uses ZIP;
 Windows uses EXE. The Admin validates this schema; Desktop validates downloaded
 content and signatures. Upload signed installers separately. No releasectl command
 is added. The existing `/api/installers` catalog is unchanged.
+
+Test and production feeds are isolated by their configured URLs/domains. Manifests have no channel field and accept valid SemVer prereleases; the production publishing workflow owns release selection. Existing Desktop clients that require channel must be upgraded before switching their feed to this format.

@@ -11,7 +11,7 @@ import (
 )
 
 func testDesktopManifest() DesktopManifest {
-	return DesktopManifest{SchemaVersion: 1, ProductID: "cutej", Channel: "stable", Version: "0.5.0", PublishedAt: "2026-09-12T08:00:00Z", ReleaseNotes: map[string][]string{"zh-CN": {"更新说明"}, "en-US": {"Update notes"}}, Artifacts: map[string]DesktopArtifact{
+	return DesktopManifest{SchemaVersion: 1, ProductID: "cutej", Version: "0.5.0", PublishedAt: "2026-09-12T08:00:00Z", ReleaseNotes: map[string][]string{"zh-CN": {"更新说明"}, "en-US": {"Update notes"}}, Artifacts: map[string]DesktopArtifact{
 		"darwin-arm64": {URL: "https://example.com/CuteJ-0.5.0.zip", Size: 123, SHA256: strings.Repeat("a", 64)},
 		"win32-x64":    {URL: "https://example.com/CuteJ-0.5.0.exe", Size: 456, SHA256: strings.Repeat("b", 64)},
 	}}
@@ -21,8 +21,7 @@ func TestDesktopUpdateValidation(t *testing.T) {
 	mutations := map[string]func(*DesktopManifest){
 		"schema":          func(m *DesktopManifest) { m.SchemaVersion = 2 },
 		"product":         func(m *DesktopManifest) { m.ProductID = "../cutej" },
-		"beta":            func(m *DesktopManifest) { m.Channel = "../beta" },
-		"prerelease":      func(m *DesktopManifest) { m.Version = "0.5.0-beta.1" },
+		"prerelease":      func(m *DesktopManifest) { m.Version = "0.5.0-beta.01" },
 		"leading zero":    func(m *DesktopManifest) { m.Version = "0.05.0" },
 		"date":            func(m *DesktopManifest) { m.PublishedAt = "yesterday" },
 		"notes":           func(m *DesktopManifest) { m.ReleaseNotes = nil },
@@ -111,7 +110,6 @@ func TestNamedFeedsIndependentHistoryConflictAndDisable(t *testing.T) {
 	}
 	stable := testDesktopManifest()
 	beta := testDesktopManifest()
-	beta.Channel = "beta"
 	beta.Version = "0.6.0-beta.1"
 	if _, err := c.SaveUpdateFeed(ctx, "desktop-latest.json", feedInput(stable, 0, true), 1); err != nil {
 		t.Fatal(err)
@@ -216,5 +214,24 @@ func TestLegacySingletonMigratesOnce(t *testing.T) {
 	}
 	if _, err := c.GetPublicUpdate(ctx, item.Name); !errors.Is(err, ErrDesktopUpdateNotFound) {
 		t.Fatal("migration overwrote disabled state", err)
+	}
+}
+
+func TestDesktopManifestWithoutChannelAcceptsPrerelease(t *testing.T) {
+	m := testDesktopManifest()
+	m.Version = "0.6.0-dev.1"
+	if err := ValidateDesktopManifest(m); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"channel"`) {
+		t.Fatal("channel emitted", string(raw))
+	}
+	decoded, err := decodeFeedManifest(string(raw))
+	if err != nil || !reflect.DeepEqual(decoded, m) {
+		t.Fatal(decoded, err)
 	}
 }

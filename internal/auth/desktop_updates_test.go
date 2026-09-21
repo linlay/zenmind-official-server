@@ -69,7 +69,7 @@ func testAdminNamedUpdates(t *testing.T, directory bool) {
 			t.Fatalf("want %d got %d: %s", status, rec.Code, rec.Body.String())
 		}
 	}
-	raw := `{"schemaVersion":1,"productId":"cutej","channel":"beta","version":"0.6.0-beta.1","publishedAt":"2026-09-12T08:00:00Z","releaseNotes":{"en-US":["Update"]},"artifacts":{"darwin-arm64":{"url":"https://example.com/app.zip","size":12,"sha256":"` + strings.Repeat("a", 64) + `"}}}`
+	raw := `{"schemaVersion":1,"productId":"cutej","version":"0.6.0-beta.1","publishedAt":"2026-09-12T08:00:00Z","releaseNotes":{"en-US":["Update"]},"artifacts":{"darwin-arm64":{"url":"https://example.com/app.zip","size":12,"sha256":"` + strings.Repeat("a", 64) + `"}}}`
 	body := `{"description":"Beta","enabled":true,"revision":0,"manifest":` + raw + `}`
 	const admin = "/api/admin/updates/desktop-beta.json"
 	check(request("GET", "/api/admin/updates", "", false, false, ""), 401)
@@ -97,8 +97,11 @@ func testAdminNamedUpdates(t *testing.T, directory bool) {
 	if rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("missing no-store")
 	}
+	if strings.Contains(rec.Body.String(), `"channel"`) {
+		t.Fatal("public feed emitted channel")
+	}
 	var m release.DesktopManifest
-	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil || m.Channel != "beta" {
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil || m.Version != "0.6.0-beta.1" {
 		t.Fatal(m, err)
 	}
 	check(request("GET", "/api/updates/desktop-latest.json", "", false, false, ""), 404)
