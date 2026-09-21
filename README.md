@@ -202,4 +202,4 @@ Windows uses EXE. The Admin validates this schema; Desktop validates downloaded
 content and signatures. Upload signed installers separately. No releasectl command
 is added. The existing `/api/installers` catalog is unchanged.
 
-Test and production feeds are isolated by their configured URLs/domains. Manifests have no channel field and accept valid SemVer prereleases; the production publishing workflow owns release selection. Existing Desktop clients that require channel must be upgraded before switching their feed to this format.
+Test and production feeds are isolated by their configured URLs/domains. Manifests accept valid SemVer prereleases; the production publishing workflow owns release selection.

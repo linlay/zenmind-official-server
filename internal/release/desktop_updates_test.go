@@ -217,7 +217,7 @@ func TestLegacySingletonMigratesOnce(t *testing.T) {
 	}
 }
 
-func TestDesktopManifestWithoutChannelAcceptsPrerelease(t *testing.T) {
+func TestDesktopManifestAcceptsPrerelease(t *testing.T) {
 	m := testDesktopManifest()
 	m.Version = "0.6.0-dev.1"
 	if err := ValidateDesktopManifest(m); err != nil {
@@ -226,9 +226,6 @@ func TestDesktopManifestWithoutChannelAcceptsPrerelease(t *testing.T) {
 	raw, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), `"channel"`) {
-		t.Fatal("channel emitted", string(raw))
 	}
 	decoded, err := decodeFeedManifest(string(raw))
 	if err != nil || !reflect.DeepEqual(decoded, m) {

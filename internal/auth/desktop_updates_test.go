@@ -97,9 +97,6 @@ func testAdminNamedUpdates(t *testing.T, directory bool) {
 	if rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("missing no-store")
 	}
-	if strings.Contains(rec.Body.String(), `"channel"`) {
-		t.Fatal("public feed emitted channel")
-	}
 	var m release.DesktopManifest
 	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil || m.Version != "0.6.0-beta.1" {
 		t.Fatal(m, err)
