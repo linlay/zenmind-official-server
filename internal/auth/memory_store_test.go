@@ -221,7 +221,9 @@ func (s *memoryStore) UpsertEmailCodeUser(_ context.Context, email, _ string) (U
 	user := s.users[userID]
 	user.ID = userID
 	user.Email = email
-	user.DisplayName = email
+	if strings.TrimSpace(user.DisplayName) == "" {
+		user.DisplayName = email
+	}
 	if user.AuthProvider == "" {
 		user.AuthProvider = "email_code"
 		user.AuthSub = email

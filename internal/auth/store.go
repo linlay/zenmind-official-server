@@ -420,6 +420,15 @@ func (s *MySQLStore) UpsertEmailCodeUser(ctx context.Context, email, ip string) 
 	return s.upsertIdentityUser(ctx, "email_code", email, email, email, "")
 }
 
+// Email verification carries no profile name; keep a name already supplied by the user or SSO.
+const updateIdentityUserProfileSQL = `UPDATE auth_user
+ SET EMAIL_ = ?, DISPLAY_NAME_ = CASE
+   WHEN ? = 'email_code' AND TRIM(DISPLAY_NAME_) <> '' THEN DISPLAY_NAME_
+   ELSE IF(? = '', DISPLAY_NAME_, ?)
+ END,
+ AVATAR_URL_ = IF(? = '', AVATAR_URL_, ?), UPDATED_AT_ = ?, LAST_LOGIN_AT_ = ?
+ WHERE ID_ = ?`
+
 func (s *MySQLStore) upsertIdentityUser(
 	ctx context.Context,
 	provider, subject, email, displayName, avatarURL string,
@@ -498,11 +507,9 @@ func (s *MySQLStore) upsertIdentityUser(
 
 	if _, err := tx.ExecContext(
 		ctx,
-		`UPDATE auth_user
-		 SET EMAIL_ = ?, DISPLAY_NAME_ = IF(? = '', DISPLAY_NAME_, ?),
-		     AVATAR_URL_ = IF(? = '', AVATAR_URL_, ?), UPDATED_AT_ = ?, LAST_LOGIN_AT_ = ?
-		 WHERE ID_ = ?`,
+		updateIdentityUserProfileSQL,
 		email,
+		provider,
 		displayName,
 		displayName,
 		avatarURL,
