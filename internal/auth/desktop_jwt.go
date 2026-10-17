@@ -45,15 +45,16 @@ type identityJWTResult struct {
 }
 
 type identityClaims struct {
-	UserID       string `json:"user_id"`
-	Email        string `json:"email"`
-	Name         string `json:"name"`
-	Picture      string `json:"picture,omitempty"`
-	Role         string `json:"role"`
-	AuthProvider string `json:"auth_provider"`
-	AuthSub      string `json:"auth_sub,omitempty"`
-	Scope        string `json:"scope"`
-	SessionID    string `json:"sid"`
+	UserID             string `json:"user_id"`
+	Email              string `json:"email"`
+	Name               string `json:"name"`
+	Picture            string `json:"picture,omitempty"`
+	Role               string `json:"role"`
+	AuthProvider       string `json:"auth_provider"`
+	AuthSub            string `json:"auth_sub,omitempty"`
+	Scope              string `json:"scope"`
+	SessionID          string `json:"sid"`
+	SessionStartedAtMS int64  `json:"session_started_at_ms,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -135,8 +136,8 @@ func (s *identityJWTSigner) configured() bool {
 	return s != nil && s.err == nil && s.privateKey != nil && s.issuer != "" && len(s.audiences) > 0
 }
 
-func (s *identityJWTSigner) issue(user User, now time.Time, sessionID string) (identityJWTResult, error) {
-	return s.issueWithPolicy(user, now, sessionID, s.audiences, desktopSsoScope, s.ttl)
+func (s *identityJWTSigner) issue(user User, now time.Time, sessionID string, sessionStartedAt time.Time) (identityJWTResult, error) {
+	return s.issueWithPolicy(user, now, sessionID, s.audiences, desktopSsoScope, s.ttl, sessionStartedAt)
 }
 
 func (s *identityJWTSigner) issueWithPolicy(
@@ -146,6 +147,7 @@ func (s *identityJWTSigner) issueWithPolicy(
 	audiences []string,
 	scope string,
 	ttl time.Duration,
+	sessionStartedAt time.Time,
 ) (identityJWTResult, error) {
 	if s == nil || s.err != nil || s.privateKey == nil || s.issuer == "" {
 		if s != nil && s.err != nil && !errors.Is(s.err, errDesktopJWTNotConfigured) {
@@ -183,6 +185,9 @@ func (s *identityJWTSigner) issueWithPolicy(
 			IssuedAt:  jwt.NewNumericDate(now),
 			ID:        jti,
 		},
+	}
+	if !sessionStartedAt.IsZero() {
+		claims.SessionStartedAtMS = sessionStartedAt.UnixMilli()
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = s.keyID

@@ -27,6 +27,7 @@ type memoryStore struct {
 type sessionRecord struct {
 	userID    int64
 	csrfToken string
+	startedAt time.Time
 	expiresAt time.Time
 	revoked   bool
 }
@@ -303,7 +304,7 @@ func (s *memoryStore) CreateSession(_ context.Context, userID int64, tokenHash, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.sessions[tokenHash] = sessionRecord{userID: userID, csrfToken: csrfToken, expiresAt: expiresAt}
+	s.sessions[tokenHash] = sessionRecord{userID: userID, csrfToken: csrfToken, expiresAt: expiresAt, startedAt: time.Now().UTC()}
 	return nil
 }
 
@@ -315,6 +316,16 @@ func (s *memoryStore) FindSessionCSRF(_ context.Context, tokenHash string, now t
 		return "", ErrNotFound
 	}
 	return session.csrfToken, nil
+}
+
+func (s *memoryStore) FindSessionStartedAt(_ context.Context, tokenHash string, now time.Time) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.sessions[tokenHash]
+	if !ok || session.revoked || !session.expiresAt.After(now) || session.startedAt.IsZero() {
+		return time.Time{}, ErrNotFound
+	}
+	return session.startedAt, nil
 }
 
 func (s *memoryStore) RevokeSession(_ context.Context, tokenHash string) error {

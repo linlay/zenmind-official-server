@@ -99,6 +99,7 @@ type Store interface {
 	ConsumeOAuthRequest(ctx context.Context, stateHash string, now time.Time) (OAuthRequest, error)
 	CreateSession(ctx context.Context, userID int64, tokenHash, csrfToken string, expiresAt time.Time, userAgent, ip string) error
 	FindSessionCSRF(ctx context.Context, tokenHash string, now time.Time) (string, error)
+	FindSessionStartedAt(ctx context.Context, tokenHash string, now time.Time) (time.Time, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
 	SaveDesktopSsoTicket(ctx context.Context, userID int64, ticketHash string, expiresAt time.Time, ip, userAgent string) error
 	ConsumeDesktopSsoTicket(ctx context.Context, ticketHash string, now time.Time) (User, error)
@@ -692,6 +693,18 @@ func (s *MySQLStore) FindSessionCSRF(ctx context.Context, tokenHash string, now 
 		return "", ErrNotFound
 	}
 	return csrfToken, err
+}
+
+func (s *MySQLStore) FindSessionStartedAt(ctx context.Context, tokenHash string, now time.Time) (time.Time, error) {
+	var startedAt time.Time
+	err := s.db.QueryRowContext(ctx,
+		`SELECT CREATED_AT_ FROM auth_session WHERE TOKEN_HASH_ = ? AND EXPIRES_AT_ > ?`,
+		tokenHash, now,
+	).Scan(&startedAt)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && startedAt.IsZero()) {
+		return time.Time{}, ErrNotFound
+	}
+	return startedAt.UTC(), err
 }
 
 func (s *MySQLStore) RevokeSession(ctx context.Context, tokenHash string) error {
