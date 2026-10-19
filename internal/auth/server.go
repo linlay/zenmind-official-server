@@ -778,7 +778,16 @@ func (s *Server) desktopSsoToken(w http.ResponseWriter, r *http.Request) {
 	}
 	tokenUser := user
 	tokenUser.AvatarURL = s.avatarProxy.publicURL(user)
-	jwtToken, err := s.desktopJWTSigner.issue(tokenUser, s.now(), tokenHash(sessionToken))
+	startedAt, err := s.store.FindSessionStartedAt(r.Context(), tokenHash(sessionToken), s.now().UTC())
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Login required.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "Unable to read login session.")
+		return
+	}
+	jwtToken, err := s.desktopJWTSigner.issue(tokenUser, s.now(), tokenHash(sessionToken), startedAt)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "sso_jwt_not_configured", "Desktop SSO JWT signer is not configured.")
 		return
@@ -980,6 +989,7 @@ func (s *Server) marketProxy(w http.ResponseWriter, r *http.Request) {
 			[]string{s.marketJWTAudience},
 			"market",
 			s.marketJWTTTL,
+			time.Time{},
 		)
 		if signErr != nil {
 			writeError(w, http.StatusServiceUnavailable, "market_not_configured", "Market proxy is not configured.")

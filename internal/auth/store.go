@@ -99,6 +99,7 @@ type Store interface {
 	ConsumeOAuthRequest(ctx context.Context, stateHash string, now time.Time) (OAuthRequest, error)
 	CreateSession(ctx context.Context, userID int64, tokenHash, csrfToken string, expiresAt time.Time, userAgent, ip string) error
 	FindSessionCSRF(ctx context.Context, tokenHash string, now time.Time) (string, error)
+	FindSessionStartedAt(ctx context.Context, tokenHash string, now time.Time) (time.Time, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
 	SaveDesktopSsoTicket(ctx context.Context, userID int64, ticketHash string, expiresAt time.Time, ip, userAgent string) error
 	ConsumeDesktopSsoTicket(ctx context.Context, ticketHash string, now time.Time) (User, error)
@@ -420,6 +421,15 @@ func (s *MySQLStore) UpsertEmailCodeUser(ctx context.Context, email, ip string) 
 	return s.upsertIdentityUser(ctx, "email_code", email, email, email, "")
 }
 
+// Email verification carries no profile name; keep a name already supplied by the user or SSO.
+const updateIdentityUserProfileSQL = `UPDATE auth_user
+ SET EMAIL_ = ?, DISPLAY_NAME_ = CASE
+   WHEN ? = 'email_code' AND TRIM(DISPLAY_NAME_) <> '' THEN DISPLAY_NAME_
+   ELSE IF(? = '', DISPLAY_NAME_, ?)
+ END,
+ AVATAR_URL_ = IF(? = '', AVATAR_URL_, ?), UPDATED_AT_ = ?, LAST_LOGIN_AT_ = ?
+ WHERE ID_ = ?`
+
 func (s *MySQLStore) upsertIdentityUser(
 	ctx context.Context,
 	provider, subject, email, displayName, avatarURL string,
@@ -498,11 +508,9 @@ func (s *MySQLStore) upsertIdentityUser(
 
 	if _, err := tx.ExecContext(
 		ctx,
-		`UPDATE auth_user
-		 SET EMAIL_ = ?, DISPLAY_NAME_ = IF(? = '', DISPLAY_NAME_, ?),
-		     AVATAR_URL_ = IF(? = '', AVATAR_URL_, ?), UPDATED_AT_ = ?, LAST_LOGIN_AT_ = ?
-		 WHERE ID_ = ?`,
+		updateIdentityUserProfileSQL,
 		email,
+		provider,
 		displayName,
 		displayName,
 		avatarURL,
@@ -685,6 +693,18 @@ func (s *MySQLStore) FindSessionCSRF(ctx context.Context, tokenHash string, now 
 		return "", ErrNotFound
 	}
 	return csrfToken, err
+}
+
+func (s *MySQLStore) FindSessionStartedAt(ctx context.Context, tokenHash string, now time.Time) (time.Time, error) {
+	var startedAt time.Time
+	err := s.db.QueryRowContext(ctx,
+		`SELECT CREATED_AT_ FROM auth_session WHERE TOKEN_HASH_ = ? AND EXPIRES_AT_ > ?`,
+		tokenHash, now,
+	).Scan(&startedAt)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && startedAt.IsZero()) {
+		return time.Time{}, ErrNotFound
+	}
+	return startedAt.UTC(), err
 }
 
 func (s *MySQLStore) RevokeSession(ctx context.Context, tokenHash string) error {

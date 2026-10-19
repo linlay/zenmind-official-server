@@ -168,6 +168,91 @@ func TestEmailCodeVerifyCreatesSessionAndConsumesCode(t *testing.T) {
 	}
 }
 
+func TestEmailCodeLoginPreservesProfileInMeAndSSO(t *testing.T) {
+	for _, tc := range []struct {
+		name, existing, want string
+		newUser              bool
+	}{
+		{name: "new user", want: "same@example.com", newUser: true},
+		{name: "existing SSO name", existing: "x xie", want: "x xie"},
+		{name: "empty name", want: "same@example.com"},
+		{name: "whitespace name", existing: "   ", want: "same@example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, store, _ := testHandlerWithMailer(t)
+			var originalID int64
+			if !tc.newUser {
+				user, err := store.UpsertGoogleUser(context.Background(), GoogleIdentity{Subject: "same-subject", Email: "same@example.com", EmailVerified: true, Name: tc.existing, Picture: ""}, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				user.DisplayName = tc.existing
+				store.users[user.ID] = user
+				originalID = user.ID
+			}
+			// Includes first-time identity linking and repeated email logins.
+			for i := 0; i < 2; i++ {
+				// Bypass the endpoint send cooldown; verification still uses a real stored code.
+				code := "123456"
+				if err := store.SaveEmailCode(context.Background(), "same@example.com", emailCodeHash("same@example.com", code), time.Now().Add(time.Minute)); err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest(http.MethodPost, "/api/auth/email-code/verify", bytes.NewBufferString(`{"email":"same@example.com","code":"`+code+`"}`))
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("verify: %d %s", rec.Code, rec.Body.String())
+				}
+				cookies := rec.Result().Cookies()
+				if len(cookies) == 0 {
+					t.Fatal("missing session cookie")
+				}
+				cookie := cookies[0]
+				meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+				meReq.AddCookie(cookie)
+				meRec := httptest.NewRecorder()
+				handler.ServeHTTP(meRec, meReq)
+				var me struct {
+					User User `json:"user"`
+				}
+				if meRec.Code != http.StatusOK {
+					t.Fatalf("me: %d %s", meRec.Code, meRec.Body.String())
+				}
+				if err := json.Unmarshal(meRec.Body.Bytes(), &me); err != nil {
+					t.Fatal(err)
+				}
+				if me.User.DisplayName != tc.want {
+					t.Fatalf("me name = %q, want %q", me.User.DisplayName, tc.want)
+				}
+				if originalID == 0 {
+					originalID = me.User.ID
+				}
+				if me.User.ID != originalID {
+					t.Fatalf("identity changed: %d != %d", me.User.ID, originalID)
+				}
+				tokenReq := httptest.NewRequest(http.MethodPost, "/api/auth/desktop-sso/token", nil)
+				tokenReq.AddCookie(cookie)
+				tokenReq.Header.Set("X-CSRF-Token", csrfTokenForCookie(t, handler, cookie))
+				tokenRec := httptest.NewRecorder()
+				handler.ServeHTTP(tokenRec, tokenReq)
+				if tokenRec.Code != http.StatusOK {
+					t.Fatalf("sso: %d %s", tokenRec.Code, tokenRec.Body.String())
+				}
+				var response struct {
+					User        User   `json:"user"`
+					AccessToken string `json:"accessToken"`
+				}
+				if err := json.Unmarshal(tokenRec.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if response.User.DisplayName != tc.want || decodeTestJWTClaims(t, response.AccessToken)["name"] != tc.want {
+					t.Fatal("SSO name differs from me")
+				}
+			}
+		})
+	}
+}
+
 func TestEmailCodeRejectsInvalidEmail(t *testing.T) {
 	handler, _, _ := testHandlerWithMailer(t)
 
