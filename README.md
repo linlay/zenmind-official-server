@@ -203,3 +203,7 @@ content and signatures. Upload signed installers separately. No releasectl comma
 is added. The existing `/api/installers` catalog is unchanged.
 
 Test and production feeds are isolated by their configured URLs/domains. Manifests accept valid SemVer prereleases; the production publishing workflow owns release selection.
+
+### Desktop login-session proof
+
+Desktop SSO JWTs include `session_started_at_ms`, the UTC creation time of the existing website login session in Unix milliseconds. Token renewal preserves this value; completing a new login creates a new session. Tunnel Hub uses the signed value to distinguish a new login after device removal from renewal of an old session. No session table migration is required. Roll out the website server before Tunnel Hub and Desktop.
